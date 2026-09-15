@@ -461,6 +461,23 @@ def to_number(text):
     return value if _is_finite(value) else None
 
 
+# The columns a verdict cannot be reached without. The rest refine it.
+REQUIRED_FIELDS = ("score", "match_type", "x", "y")
+
+
+def missing_columns(fields, header):
+    """Split absent columns into the ones that break the audit and the rest.
+
+    Reporting both as one "warning" made a valid Esri export, which simply has
+    no USER_address column, look broken.
+    """
+    absent = [key for key, name in fields.items() if name and name not in header]
+    return {
+        "required": sorted(fields[k] for k in absent if k in REQUIRED_FIELDS),
+        "optional": sorted(fields[k] for k in absent if k not in REQUIRED_FIELDS),
+    }
+
+
 def fields_for(profile, overrides=None):
     """Column names for a profile, with the explicit overrides applied."""
     if profile not in PROFILES:
@@ -923,6 +940,30 @@ def self_test():
     check(_parse(["--csv", "g.csv", "--profile", "census"]).profile == "census",
           "--profile is read")
     check(_parse(["--csv", "g.csv", "--apply"]).apply is True, "--apply is read")
+
+    # ---- the csv can arrive positionally, the way a script tool passes it
+    check(_parse(["g.csv"]).csv == "g.csv",
+          "a positional CSV is accepted, for an ArcGIS script tool")
+    check(_parse(["--csv", "named.csv"]).csv == "named.csv",
+          "a named CSV is accepted")
+    check(_parse(["pos.csv", "--csv", "named.csv"]).csv == "named.csv",
+          "the named CSV wins when both forms are given")
+    check(_parse(["--self-test"]).csv is None,
+          "no CSV is needed to run the self-test")
+
+    # ---- an absent optional column is a note, an absent required one is a warning
+    f = fields_for("esri")
+    m = missing_columns(f, ["Score", "Addr_type", "X", "Y", "Match_addr"])
+    check(m["required"] == [],
+          "a valid Esri export is missing no required column")
+    check(m["optional"] == ["USER_address"],
+          "a missing input-address column is optional, not a warning  <-- pinned defect")
+    m = missing_columns(f, ["Addr_type", "X", "Y"])
+    check("Score" in m["required"],
+          "a missing score column is required, because every row then reads SUSPECT")
+    m = missing_columns(f, ["Score", "Addr_type", "X", "Y", "Match_addr", "USER_address"])
+    check(m["required"] == [] and m["optional"] == [],
+          "a complete header reports nothing missing")
     check(_parse(["--csv", "g.csv", "--boundary", "b.json"]).boundary == "b.json",
           "--boundary is read")
     check(_parse(["--csv", "g.csv", "--min-trust-rate", "0.5"]
@@ -1010,7 +1051,11 @@ def _parse(argv):
         epilog="Config precedence: flag > environment > the CONFIGURATION "
                "block. Nothing is written without --apply.",
     )
-    ap.add_argument("--csv", help="CSV of geocoded results to audit")
+    ap.add_argument("csv_positional", nargs="?", metavar="CSV",
+                    help="CSV of geocoded results to audit, as a positional "
+                         "argument so an ArcGIS script tool can pass it")
+    ap.add_argument("--csv", help="the same CSV, named. This wins over the "
+                                  "positional form when both are given")
     ap.add_argument("--profile", default=DEFAULT_PROFILE,
                     choices=sorted(PROFILES),
                     help="column names and match types to expect "
@@ -1059,7 +1104,12 @@ def _parse(argv):
                     help="write --out. Without this nothing is written.")
     ap.add_argument("--self-test", dest="self_test", action="store_true",
                     help="run the offline assertions and exit")
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    # A script tool passes parameters positionally; a shell user usually names
+    # them. Accept both and let the named one win, matching fullpull.
+    if not args.csv and getattr(args, "csv_positional", None):
+        args.csv = args.csv_positional
+    return args
 
 
 def main(argv=None):
@@ -1097,14 +1147,18 @@ def main(argv=None):
         print("error: %s" % exc, file=sys.stderr)
         return 2
 
-    missing = [name for key, name in fields.items()
-               if name and name not in header]
-    if missing:
+    missing = missing_columns(fields, header)
+    if missing["required"]:
         # Naming the columns matters. A score column that is silently absent
         # reads as None on every row and quietly turns the whole batch SUSPECT,
         # which looks like a data problem rather than a wrong --profile.
-        print("warning: columns not in the CSV: %s" % ", ".join(sorted(missing)),
-              file=sys.stderr)
+        print("warning: required columns not in the CSV: %s"
+              % ", ".join(missing["required"]), file=sys.stderr)
+    if missing["optional"]:
+        # An optional column absent is normal, not a fault. Saying which CHECK
+        # is skipped is useful; calling a valid export a warning is not.
+        print("note: %s not in the CSV, so the house-number check is skipped"
+              % ", ".join(missing["optional"]), file=sys.stderr)
 
     rows = [extract_row(raw, fields) for raw in raw_rows]
     try:
