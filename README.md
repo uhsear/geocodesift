@@ -36,7 +36,7 @@ PASS  a boundary holding no polygon raises rather than skipping the check  <-- p
 PASS  --apply defaults to OFF
 ...
 --------------------------------------------------------------------
-151 assertions, 0 failed
+159 assertions, 0 failed
 ```
 
 ## Requirements
@@ -51,6 +51,15 @@ python geocodesift.py --self-test
 ```
 
 ## Usage
+
+The CSV can be named or positional. A script tool passes its parameters
+positionally, so both forms work and the named one wins when both appear.
+
+```
+python geocodesift.py results.csv
+python geocodesift.py --csv results.csv --profile esri
+```
+
 
 The audit is read-only. The audited copy of the CSV is written only with `--apply`.
 
