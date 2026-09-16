@@ -21,29 +21,43 @@ PASS  score 100 at match type Zip5 is REJECT  <-- pinned defect
 PASS  a confident PostalExt is REJECT
 PASS  a city centroid at score 99 is REJECT
 ...
-PASS  a point whose ray passes through two vertices is still inside
 PASS  a point on a horizontal hole edge is inside
+PASS  a point whose ray passes through two vertices is still inside
 ...
 PASS  only the planted stack fires at threshold 5
 PASS  a legitimate complex of 4 does not fire at threshold 5
 ...
 PASS  eight stacked rows leave the TRUST count at 2  <-- pinned defect
-PASS  an empty batch fails the gate rather than scoring a perfect rate  <-- pinned defect
-...
 PASS  a NaN coordinate is REJECT, not a point on the map  <-- pinned defect
 PASS  a boundary holding no polygon raises rather than skipping the check  <-- pinned defect
 ...
-PASS  --apply defaults to OFF
+PASS  an empty batch fails the gate rather than scoring a perfect rate  <-- pinned defect
 ...
+PASS  a scoreless refusal does not describe a score it never had  <-- pinned defect
+PASS  a four row census batch audits 1 TRUST, 1 SUSPECT and 2 REJECT
+PASS  a four row nominatim batch audits 1 TRUST, 1 SUSPECT and 2 REJECT
+...
+PASS  a UTF-8 BOM is stripped from the first column name  <-- pinned defect
+PASS  the surplus cells of a ragged row do not reach the writer  <-- pinned defect
+PASS  auditing an audited CSV does not add gcs_verdict twice  <-- pinned defect
+PASS  --out without --apply writes nothing at all  <-- pinned defect
+...
+PASS  a point in the middle of the lake is not contained
+PASS  the row that left the county is written REJECT with that reason
+PASS  the six field overrides make the same CSV auditable
+...
+PASS  a CSV field over the csv module's own limit exits 2, not 1  <-- pinned defect
+PASS  an unreadable floor in the environment is refused, not ignored  <-- pinned defect
 --------------------------------------------------------------------
-159 assertions, 0 failed
+298 assertions, 0 failed
 ```
 
 ## Requirements
 
-Python 3.9 or later. Standard library only: `csv`, `json`, `math`, `argparse`. No `arcpy`, no
-`shapely`, no `pandas`, no network and no credentials. It runs the same on ArcGIS Pro's Python
-and on a plain `python3`.
+Python 3.9 or later. Standard library only: `csv`, `json`, `math`, `argparse`, and `tempfile`,
+`shutil`, `io` and `contextlib` for the self-test's own temporary files. No `arcpy`, no `shapely`,
+no `pandas`, no network and no credentials. It runs the same on ArcGIS Pro's Python and on a plain
+`python3`.
 
 ```
 git clone https://github.com/uhsear/geocodesift.git
@@ -111,6 +125,19 @@ FAIL: the batch is below the trust floor. Do not publish it.
 
 The other overrides are `--match-type-field`, `--x-field`, `--y-field`, `--address-field` and
 `--matched-address-field`. Each one replaces a single column name from the profile.
+
+Each profile is a set of column names and a set of match types:
+
+| Profile | score | match type | x | y | matched address | input address |
+|---|---|---|---|---|---|---|
+| `esri` | `Score` | `Addr_type` | `X` | `Y` | `Match_addr` | `USER_address` |
+| `census` | none | `match_type` | `lon` | `lat` | `matched_address` | `input_address` |
+| `nominatim` | `importance` | `addresstype` | `lon` | `lat` | `display_name` | `query` |
+
+The `census` profile reads no score column, because the Census batch geocoder returns none. The
+match type then carries the whole decision: `Exact` is TRUST, `Non_Exact` is SUSPECT, and `Tie` and
+`No_Match` are REJECT. A refusal under that profile names the match type and says nothing about a
+score, because there was never a score to report.
 
 Exit codes: 0 the batch passed, 1 the batch failed the gate, 2 the input could not be read,
 64 usage error.
