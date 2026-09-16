@@ -32,11 +32,15 @@ not be read, 64 usage error.
 from __future__ import print_function
 
 import argparse
+import contextlib
 import csv
+import io
 import json
 import math
 import os
+import shutil
 import sys
+import tempfile
 
 # =============================================================================
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
@@ -241,10 +245,15 @@ def classify(score, match_type, profile=DEFAULT_PROFILE, trust_score=None,
     pct = None if score is None else 100.0 * float(score) / prof["score_max"]
 
     if mt in prof["reject_types"]:
+        if score is None:
+            # The Census profile carries no score, so the sentence below has
+            # nothing to put in it. Reading "The score is absent says how well
+            # that AREA matched" is worse than saying less.
+            return REJECT, ("match type %r is not an address-level match"
+                            % (match_type,))
         return REJECT, ("match type %r is an area fallback, not an address. "
-                        "The score %s says how well that AREA matched."
-                        % (match_type,
-                           "is absent" if score is None else "%.4g" % score))
+                        "The score %.4g says how well that AREA matched."
+                        % (match_type, score))
 
     if pct is not None and pct < suspect_score:
         return REJECT, ("score %.4g is below the reject floor of %.4g"
@@ -463,6 +472,9 @@ def to_number(text):
 
 # The columns a verdict cannot be reached without. The rest refine it.
 REQUIRED_FIELDS = ("score", "match_type", "x", "y")
+
+# The two columns --out adds to a copy of the input.
+ADDED_COLUMNS = ("gcs_verdict", "gcs_reasons")
 
 
 def missing_columns(fields, header):
@@ -702,6 +714,43 @@ def self_test():
                             suspect_score=80.0),
            "a reject floor above the trust floor raises")
 
+    # ---- the floors at their exact boundary, and the units they report in
+    check(verdict(75, "PointAddress") == SUSPECT,
+          "exactly the reject floor of 75 is SUSPECT, the floor is inclusive")
+    check(verdict(74.9, "PointAddress") == REJECT,
+          "a tenth under the reject floor of 75 is REJECT")
+    check(classify(60, "PointAddress")[1]
+          == "score 60 is below the reject floor of 75",
+          "the refusal names the reject floor in the score's own units")
+    check(classify(83, "PointAddress")[1]
+          == "score 83 is under the trust floor of 90",
+          "the demotion names the trust floor in the score's own units")
+    check(verdict(0, "PointAddress") == REJECT,
+          "a score of 0 is a refusal, not an illegal score")
+    check(classify(90, "PointAddress", trust_score=0.0,
+                   suspect_score=0.0)[0] == TRUST,
+          "floors of 0 are legal and let everything through")
+    check(classify(80, "PointAddress", trust_score=80.0,
+                   suspect_score=80.0)[0] == TRUST,
+          "two equal floors are legal, they are not the wrong order")
+    raises(lambda: classify(90, "PointAddress", suspect_score=-1.0),
+           "a negative reject floor raises")
+    check(classify(0.05, "house", "nominatim")[1]
+          == "score 0.05 is below the reject floor of 0.1",
+          "a nominatim floor is reported in importance, not in percent")
+    check(classify(0.15, "house", "nominatim")[1]
+          == "score 0.15 is under the trust floor of 0.2",
+          "the nominatim trust floor is reported in importance too")
+    check(verdict(0.2, "house", "nominatim") == TRUST,
+          "an importance exactly at the nominatim trust floor is TRUST")
+    check(verdict(90, "Exact", "census") == TRUST,
+          "a score column named onto the census profile reads on its 0 to "
+          "100 scale")
+    check(worse(SUSPECT, REJECT) == REJECT and worse(REJECT, SUSPECT) == REJECT,
+          "REJECT beats SUSPECT whichever order the two arrive in")
+    check(worse(TRUST, SUSPECT) == SUSPECT and worse(SUSPECT, TRUST) == SUSPECT,
+          "SUSPECT beats TRUST whichever order the two arrive in")
+
     # ---- ray casting against a concave C with an interior ring
     # The exterior is a C opening east: a notch is cut from x 4..10, y 4..6.
     # The hole is the square 1,1 to 3,3.
@@ -748,6 +797,33 @@ def self_test():
     raises(lambda: point_in_ring(0, 0, [(0, 0), (1, 1)]), "a two point ring raises")
     raises(lambda: point_in_polygon(0, 0, []), "a polygon with no ring raises")
 
+    # ---- a slanted edge. Every ring above is axis aligned, and on those the
+    # crossing x of an edge is just that edge's own x, so the interpolation is
+    # never read. A real county line is full of diagonals.
+    tri = [(0.0, 0.0), (10.0, 0.0), (0.0, 10.0)]
+    check(point_in_ring(4.0, 4.0, tri) is True,
+          "a point inside the hypotenuse is inside the triangle")
+    check(point_in_ring(6.0, 6.0, tri) is False,
+          "a point just past the hypotenuse is outside the triangle")
+    check(point_in_ring(5.0, 5.0, tri) is True,
+          "a point on the hypotenuse itself is inside the triangle")
+    # Decimal degrees off a real boundary, where the cross product of a point
+    # on the line comes out 5.55e-16 rather than 0. Without the tolerance in
+    # _on_segment this parcel reads as outside the county.
+    line_a, line_b = (-82.35233, 29.15085), (-81.69813, 29.07244)
+    on_line = ((line_a[0] + line_b[0]) / 2.0, (line_a[1] + line_b[1]) / 2.0)
+    check(point_in_ring(on_line[0], on_line[1],
+                        [line_a, line_b, (-82.0, 28.5)]) is True,
+          "a point on a slanted county line is inside, though the arithmetic "
+          "misses zero")
+    square = [(-5.0, -5.0), (15.0, -5.0), (15.0, 15.0), (-5.0, 15.0)]
+    check(point_in_polygon(5.0, 5.0, [square, tri]) is True,
+          "a point on a hole's slanted edge is inside the polygon")
+    check(point_in_polygon(3.0, 3.0, [square, tri]) is False,
+          "a point inside that slanted hole is outside the polygon")
+    check(point_in_polygon(12.0, 12.0, [square, tri]) is True,
+          "a point in the square and clear of the hole is inside")
+
     # ---- the GeoJSON shapes a county boundary actually arrives in
     bare = {"type": "Polygon", "coordinates": [outer, hole]}
     check(len(polygons_from_geojson(bare)) == 1, "a bare Polygon yields one polygon")
@@ -775,7 +851,6 @@ def self_test():
     complex4 = (-82.20000, 29.25000)   # a real four unit apartment complex
     coords = [stack] * 8 + [complex4] * 4
     coords += [(-82.30000 - i * 0.001, 29.30000 + i * 0.001) for i in range(18)]
-    check(len(coords) == 30, "the synthetic batch holds 30 rows")
     hits = find_pileups(coords, threshold=5)
     check(len(hits) == 1, "only the planted stack fires at threshold 5")
     check(hits[0][1] == 8, "the planted stack is reported with its count of 8")
@@ -795,6 +870,14 @@ def self_test():
           "a finer precision splits that near coordinate back out")
     raises(lambda: find_pileups(coords, threshold=1),
            "a pile-up threshold below 2 raises")
+    check(find_pileups([(1.0, 1.0)] * 2, threshold=2)[0][1] == 2,
+          "a threshold of 2 is legal, two records are the smallest pile-up")
+    check([n for _, n in find_pileups(coords, threshold=4)] == [8, 4],
+          "pile-ups are reported worst first")
+    check(find_pileups([(1.0, 1.0)] * 3 + [(0.0, 0.0)] * 3, threshold=3)
+          == [((0.0, 0.0), 3), ((1.0, 1.0), 3)],
+          "two pile-ups of one size are ordered by coordinate, so the report "
+          "does not shuffle")
 
     # ---- house number sanity
     check(house_number("1234 SE 17TH ST") == 1234, "a leading house number is read")
@@ -821,6 +904,16 @@ def self_test():
           "a tighter tolerance flags what the default allowed")
     raises(lambda: house_number_problem("1 A", "9 A", tolerance=-1),
            "a negative house number tolerance raises")
+    check(house_number_problem("100 MAIN ST", "120 MAIN ST") is None,
+          "exactly 20 apart is inside the default tolerance")
+    check(house_number_problem("100 MAIN ST", "121 MAIN ST") is not None,
+          "21 apart is outside the default tolerance")
+    check(house_number_problem("100 MAIN ST", "101 MAIN ST",
+                               tolerance=0) is not None,
+          "a tolerance of 0 is legal and demands the same house number")
+    check(house_number_problem("100 MAIN ST", "100 MAIN ST, OCALA",
+                               tolerance=0) is None,
+          "a tolerance of 0 still passes the same house number")
 
     # ---- field extraction off a raw CSV row
     fields = fields_for("esri")
@@ -844,6 +937,8 @@ def self_test():
                       fields)["score"] is None,
           "a NaN score cell cannot reach classify at all")
     check(extract_row({}, fields)["x"] is None, "a missing column reads None")
+    check(extract_row({"Addr_type": None}, fields)["match_type"] is None,
+          "a short row's empty cell stays absent, it does not read 'None'")
     check(fields_for("esri", {"score": "MyScore"})["score"] == "MyScore",
           "a field override replaces the profile column name")
     check(fields_for("esri", {"score": ""})["score"] == "Score",
@@ -912,10 +1007,16 @@ def self_test():
           "  <-- pinned defect")
     check(audit([]).trust_rate == 0.0, "an empty batch reports a 0% trust rate")
     raises(lambda: gate(audit([good]), 1.5), "a trust rate floor above 1 raises")
+    check(gate(audit(spread(10)), 1.0) == 0,
+          "a floor of 1.0 is legal and a clean batch clears it")
+    check(gate(audit(spread(9) + spread(1, centroid, 9)), 1.0) == 1,
+          "one bad row fails a floor of 1.0")
+    check(gate(audit(spread(8) + spread(2, centroid, 8)), 0.0) == 0,
+          "a floor of 0.0 is legal and passes a batch at 80 percent")
 
     lines = describe(audit(spread(8) + spread(2, centroid, 8)), 0.90)
-    check(any("TRUST rate: 80.0%" in l for l in lines),
-          "the report prints the trust rate")
+    check(any(l == "TRUST rate: 80.0% (floor 90.0%)" for l in lines),
+          "the report prints the trust rate and the floor it is judged against")
     check(any("row 10 REJECT" in l for l in lines),
           "the report names a failing row by its line number in the CSV")
 
@@ -924,15 +1025,14 @@ def self_test():
     check(a.apply is False, "--apply defaults to OFF")
     check(a.out is None, "--out defaults to nothing written")
     check(a.boundary is None, "--boundary defaults to off")
-    check(a.profile == DEFAULT_PROFILE, "--profile defaults to esri")
-    check(a.min_trust_rate == DEFAULT_MIN_TRUST_RATE,
-          "--min-trust-rate defaults to the configured value")
-    check(a.pileup_threshold == DEFAULT_PILEUP_THRESHOLD,
-          "--pileup-threshold defaults to the configured value")
-    check(a.pileup_precision == DEFAULT_PILEUP_PRECISION,
-          "--pileup-precision defaults to the configured value")
-    check(a.house_tolerance == DEFAULT_HOUSE_TOLERANCE,
-          "--house-number-tolerance defaults to the configured value")
+    # The values, not the constants the defaults are built from. Compared with
+    # the constant, each of these passes whatever the constant is changed to,
+    # and the README documents a number.
+    check(a.profile == "esri", "--profile defaults to esri")
+    check(a.min_trust_rate == 0.90, "--min-trust-rate defaults to 0.90")
+    check(a.pileup_threshold == 5, "--pileup-threshold defaults to 5")
+    check(a.pileup_precision == 5, "--pileup-precision defaults to 5")
+    check(a.house_tolerance == 20, "--house-number-tolerance defaults to 20")
     check(a.trust_score is None and a.suspect_score is None,
           "the score floors default to the profile's own")
     check(a.score_field is None, "--score-field defaults to the profile column")
@@ -994,6 +1094,423 @@ def self_test():
     check(_parse(["--csv", "g.csv", "--out", "o.csv"]).out == "o.csv",
           "--out is read")
 
+    # ---- the pure gaps the sections above stepped over
+    check(repr(audit([good]).results[0]).startswith("RowResult(0, TRUST"),
+          "an audited row prints its index and verdict for debugging")
+    raises(lambda: classify(90, "PointAddress", trust_score=-1.0),
+           "a negative trust floor raises")
+    check(point_in_ring(5, 0, outer) is True,
+          "a point on a ring's own edge counts as on that ring")
+    gcol = {"type": "GeometryCollection",
+            "geometries": [bare, {"type": "MultiPolygon",
+                                  "coordinates": [[outer]]}]}
+    check(len(polygons_from_geojson(gcol)) == 2,
+          "a GeometryCollection yields every polygon inside it")
+    check(to_number(97.5) == 97.5, "a cell that is already a number is read")
+    check(to_number(float("nan")) is None,
+          "a NaN that is already a float is still absent")
+    raises(lambda: fields_for("mystery"), "an unknown profile has no field map")
+
+    # ---- the Census profile's real column map over a real Census batch
+    cf = fields_for("census")
+    check((cf["x"], cf["y"], cf["match_type"]) == ("lon", "lat", "match_type"),
+          "the census profile reads lon, lat and match_type")
+    check((cf["in_addr"], cf["matched_addr"])
+          == ("input_address", "matched_address"),
+          "the census profile reads input_address and matched_address")
+    census_raw = {"input_address": "1234 SE 17TH ST, OCALA, FL, 34471",
+                  "matched_address": "1234 SE 17TH ST, OCALA, FL, 34471",
+                  "lon": "-82.12650", "lat": "29.17860",
+                  "match_type": "Exact"}
+    crow = extract_row(census_raw, cf)
+    check(crow["score"] is None,
+          "a census row carries no score, because the profile names no column")
+    check((crow["x"], crow["y"]) == (-82.1265, 29.1786),
+          "the census lon and lat columns are read as the coordinate")
+    check(crow["match_type"] == "Exact", "the census match type column is read")
+    check(crow["in_addr"].startswith("1234 SE"),
+          "the census input_address column is read")
+    check("score" not in classify(None, "No_Match", "census")[1],
+          "a scoreless refusal does not describe a score it never had"
+          "  <-- pinned defect")
+    census_rows = [crow,
+                   extract_row(dict(census_raw, match_type="Non_Exact",
+                                    lon="-82.14010", lat="29.18990"), cf),
+                   extract_row(dict(census_raw, match_type="No_Match",
+                                    lon="", lat="", matched_address=""), cf),
+                   extract_row(dict(census_raw, match_type="Tie",
+                                    lon="-82.13000", lat="29.18700"), cf)]
+    crep = audit(census_rows, "census")
+    check((crep.counts[TRUST], crep.counts[SUSPECT], crep.counts[REJECT])
+          == (1, 1, 2),
+          "a four row census batch audits 1 TRUST, 1 SUSPECT and 2 REJECT")
+    check(crep.trust_rate == 0.25,
+          "a profile with no score column still produces a gateable rate")
+    check(gate(crep, 0.90) == 1, "that census batch fails the default gate")
+
+    # ---- the Nominatim profile's real column map over a real Nominatim batch
+    nf = fields_for("nominatim")
+    check((nf["score"], nf["match_type"]) == ("importance", "addresstype"),
+          "the nominatim profile reads importance and addresstype")
+    check((nf["matched_addr"], nf["in_addr"]) == ("display_name", "query"),
+          "the nominatim profile reads display_name and query")
+    nrow = extract_row({"query": "1234 SE 17TH ST, Ocala",
+                        "display_name": "1234, Southeast 17th Street, Ocala",
+                        "lon": "-82.12650", "lat": "29.17860",
+                        "addresstype": "house", "importance": "0.45"}, nf)
+    check(nrow["score"] == 0.45,
+          "the nominatim importance column is read as the score")
+    check(nrow["matched_addr"].startswith("1234,"),
+          "the nominatim display_name column is read as the matched address")
+    nrep = audit([nrow,
+                  dict(nrow, match_type="city", score=0.82,
+                       x=-82.14010, y=29.18720),
+                  dict(nrow, match_type="road", score=0.30,
+                       x=-82.13000, y=29.17900),
+                  dict(nrow, match_type="postcode", score=0.20,
+                       x=-82.12000, y=29.16000)], "nominatim")
+    check((nrep.counts[TRUST], nrep.counts[SUSPECT], nrep.counts[REJECT])
+          == (1, 1, 2),
+          "a four row nominatim batch audits 1 TRUST, 1 SUSPECT and 2 REJECT")
+    check("AREA" in nrep.results[1].reasons[0],
+          "a prominent city is refused on its match type, not its importance")
+
+    # ---- describe() on the two reports it has to render
+    many = []
+    for i in range(6):
+        many.extend([dict(good, x=-82.0 - i, y=29.0)] * 5)
+    lines = describe(audit(many), 0.90, sample=5)
+    check(any(l == "coordinate pile-ups:" for l in lines),
+          "the report lists the pile-ups it found")
+    check(any(l.startswith("  5 record(s) on") for l in lines),
+          "each pile-up is printed with its count and its coordinate")
+    check(any(l == "  ...and 1 more" for l in lines),
+          "the report stops after the sample and counts the rest")
+    check(sum(1 for l in describe(audit(many), 0.90)
+              if l.startswith("  5 record(s) on")) == 5,
+          "describe samples five pile-ups when it is given no sample size")
+    five = []
+    for i in range(5):
+        five.extend([dict(good, x=-82.0 - i, y=29.0)] * 5)
+    check(not any("...and" in l for l in describe(audit(five), 0.90)),
+          "exactly the sample size prints no and-more line")
+    lines = describe(audit(spread(3)), 0.90)
+    check(not any("not TRUST" in l for l in lines),
+          "a clean batch lists no failing rows at all")
+
+    # ---- real files on disk. Everything below writes into one temp directory
+    # and deletes it again. No network, no database, no credentials.
+    tmp = tempfile.mkdtemp(prefix="geocodesift-selftest-")
+
+    def tmpfile(name, text, encoding="utf-8"):
+        path = os.path.join(tmp, name)
+        with open(path, "w", newline="", encoding=encoding) as handle:
+            handle.write(text)
+        return path
+
+    def run_cli(argv):
+        """main() with its output captured, so the self-test stays readable."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    # A ten row Esri batch: 5 TRUST, 3 SUSPECT, 2 REJECT, and one of the TRUST
+    # rows sits outside the county boundary built further down.
+    batch_text = (
+        "Score,Addr_type,X,Y,Match_addr,USER_address\n"
+        "98,PointAddress,-82.30000,29.20000,100 MAIN ST,100 MAIN ST\n"
+        "100,Zip5,-82.31000,29.21000,\"OCALA, FL, 34471\",1234 SE 17TH ST\n"
+        "97,PointAddress,-82.32000,29.22000,9100 SW 20TH ST,1234 SW 20TH ST\n"
+        "88,PointAddress,-82.33000,29.23000,1300 NE 8TH AVE,1300 NE 8TH AVE\n"
+        "61,PointAddress,-82.34000,29.24000,55 NW 10TH AVE,55 NW 10TH AVE\n"
+        "98,StreetName,-82.35000,29.25000,SE 17TH ST,1234 SE 17TH ST\n"
+        "99,PointAddress,-83.50000,29.20000,700 CEDAR ST,700 CEDAR ST\n"
+        "98,PointAddress,-82.36000,29.26000,240 SE 5TH ST,240 SE 5TH ST\n"
+        "96,PointAddress,-82.37000,29.27000,18 NW 3RD AVE,18 NW 3RD AVE\n"
+        "95,PointAddress,-82.38000,29.28000,4110 SW 7TH ST,4110 SW 7TH ST\n")
+    batch_csv = tmpfile("batch.csv", batch_text)
+
+    code, out, err = run_cli(["--csv", batch_csv])
+    check(code == 1, "the ten row batch fails the default 90% floor")
+    check("TRUST rate: 50.0%" in out, "half of that batch is TRUST")
+    check("FAIL: the batch is below" in out, "a failing batch says so in words")
+    check(err == "", "a complete Esri header reports nothing missing")
+    code, out, err = run_cli(["--csv", batch_csv, "--min-trust-rate", "0.5"])
+    check(code == 0, "the same batch passes a floor it exactly meets")
+    check("PASS: the batch clears" in out, "a passing batch says so in words")
+
+    # ---- the UTF-8 BOM that Excel and Table To Table both write
+    bom_csv = tmpfile("bom.csv", batch_text, encoding="utf-8-sig")
+    bom_rows, bom_header = read_csv(bom_csv)
+    check(bom_header[0] == "Score",
+          "a UTF-8 BOM is stripped from the first column name  <-- pinned defect")
+    check(bom_rows[0]["Score"] == "98",
+          "the score column of a BOM file is still addressable by name")
+    check(run_cli(["--csv", bom_csv, "--min-trust-rate", "0.5"])[0] == 0,
+          "a BOM file audits the same as one without  <-- pinned defect")
+
+    # ---- a ragged CSV, written back out with the two audit columns
+    ragged_csv = tmpfile(
+        "ragged.csv",
+        "Score,Addr_type,X,Y,Match_addr,USER_address\n"
+        "98,PointAddress,-82.30000,29.20000,100 MAIN ST,100 MAIN ST,STRAY,MORE\n"
+        "97,PointAddress,-82.31000\n")
+    rag_rows, rag_header = read_csv(ragged_csv)
+    check(None in rag_rows[0],
+          "a row with surplus commas parks the extra cells under the None key")
+    check(rag_rows[1]["Y"] is None, "a short row leaves its missing cells empty")
+    esri = fields_for("esri")
+    rag_results = audit([extract_row(r, esri) for r in rag_rows]).results
+    rag_out = os.path.join(tmp, "ragged-audited.csv")
+    write_audited(rag_out, rag_rows, rag_header, rag_results)
+    back, back_header = read_csv(rag_out)
+    check(back_header == rag_header + list(ADDED_COLUMNS),
+          "the audited copy keeps every input column and adds two")
+    check(None not in back[0],
+          "the surplus cells of a ragged row do not reach the writer"
+          "  <-- pinned defect")
+    check(back[0]["gcs_verdict"] == TRUST and back[1]["gcs_verdict"] == REJECT,
+          "each row is written with its own verdict")
+    check("no usable coordinate" in back[1]["gcs_reasons"],
+          "the reason for a verdict is written beside it")
+    twice = os.path.join(tmp, "ragged-audited-twice.csv")
+    write_audited(twice, back, back_header,
+                  audit([extract_row(r, esri) for r in back]).results)
+    twice_rows, twice_header = read_csv(twice)
+    check(twice_header == back_header,
+          "auditing an audited CSV does not add gcs_verdict twice"
+          "  <-- pinned defect")
+    check(twice_rows[0]["gcs_verdict"] == TRUST,
+          "the second audit overwrites the first verdict instead of doubling it")
+
+    # ---- --out and --apply
+    out_path = os.path.join(tmp, "audited.csv")
+    code, out, err = run_cli(["--csv", batch_csv, "--out", out_path,
+                              "--min-trust-rate", "0.5"])
+    check(not os.path.exists(out_path),
+          "--out without --apply writes nothing at all  <-- pinned defect")
+    check("was not written" in out, "--out without --apply says what it skipped")
+    code, out, err = run_cli(["--csv", batch_csv, "--out", out_path, "--apply",
+                              "--min-trust-rate", "0.5"])
+    check(code == 0 and os.path.exists(out_path),
+          "--apply writes the audited copy")
+    check("wrote %s" % out_path in out, "the run names the file it wrote")
+    written, written_header = read_csv(out_path)
+    check(len(written) == 10, "every input row is in the audited copy")
+    check(written_header[-2:] == list(ADDED_COLUMNS),
+          "the two audit columns are appended last")
+    check([r["gcs_verdict"] for r in written].count(TRUST) == 5,
+          "the verdicts in the file match the ones on the screen")
+    check(written[1]["gcs_verdict"] == REJECT
+          and "area fallback" in written[1]["gcs_reasons"],
+          "the centroid row is written REJECT with its reason")
+    check(written[0]["Match_addr"] == "100 MAIN ST",
+          "the input columns are copied through unchanged")
+    check(run_cli(["--csv", batch_csv, "--out", tmp, "--apply"])[0] == 2,
+          "a write that fails exits 2, not the gate's 1")
+
+    # ---- a county boundary from a GeoJSON file on disk, lake included
+    county = [[-82.40, 29.05], [-81.90, 29.05], [-81.90, 29.45],
+              [-82.05, 29.45], [-82.05, 29.30], [-82.40, 29.30]]
+    lake = [[-82.20, 29.15], [-82.10, 29.15], [-82.10, 29.22], [-82.20, 29.22]]
+    county_path = tmpfile("county.geojson", json.dumps(
+        {"type": "FeatureCollection", "features": [
+            {"type": "Feature", "properties": {"NAME": "Marion"},
+             "geometry": {"type": "Polygon",
+                          "coordinates": [county, lake]}}]}),
+        encoding="utf-8-sig")
+    polys = read_boundary(county_path)
+    check(len(polys) == 1 and len(polys[0]) == 2,
+          "the boundary file reads back as one polygon with one hole")
+    check(point_in_any(-82.30, 29.20, polys) is True,
+          "a point in the body of the county is contained")
+    check(point_in_any(-81.95, 29.40, polys) is True,
+          "a point in the county's narrow northern arm is contained")
+    check(point_in_any(-82.15, 29.18, polys) is False,
+          "a point in the middle of the lake is not contained")
+    check(point_in_any(-82.30, 29.40, polys) is False,
+          "a point in the notch beside the arm is not contained")
+    check(point_in_any(-83.50, 29.20, polys) is False,
+          "a point in the next county is not contained")
+    code, out, err = run_cli(["--csv", batch_csv, "--boundary", county_path,
+                              "--min-trust-rate", "0.4"])
+    check(code == 0, "the batch clears a floor set for the boundary run")
+    check("TRUST rate: 40.0%" in out,
+          "the row outside the county drops the rate from 50% to 40%")
+    outside_path = os.path.join(tmp, "boundary-audited.csv")
+    run_cli(["--csv", batch_csv, "--boundary", county_path, "--out",
+             outside_path, "--apply", "--min-trust-rate", "0.4"])
+    bounded, _ = read_csv(outside_path)
+    check(bounded[6]["gcs_verdict"] == REJECT
+          and "falls outside the boundary" in bounded[6]["gcs_reasons"],
+          "the row that left the county is written REJECT with that reason")
+    check(bounded[0]["gcs_verdict"] == TRUST,
+          "a row inside the county keeps the verdict its score earned")
+    bad_json = tmpfile("bad.geojson", "{not json at all")
+    check(run_cli(["--csv", batch_csv, "--boundary", bad_json])[0] == 2,
+          "a boundary that is not JSON exits 2, not the gate's 1")
+    empty_fc = tmpfile("empty.geojson",
+                       '{"type": "FeatureCollection", "features": []}')
+    check(run_cli(["--csv", batch_csv, "--boundary", empty_fc])[0] == 64,
+          "a boundary file holding no polygon refuses the run  <-- pinned defect")
+
+    # ---- the per-field overrides, end to end on a CSV that names nothing the
+    # profile expects
+    odd_csv = tmpfile(
+        "odd.csv",
+        "CONF,KIND,LON,LAT,OUT_ADDR,IN_ADDR\n"
+        "98,PointAddress,-82.30000,29.20000,100 MAIN ST,100 MAIN ST\n"
+        "100,Zip5,-82.31000,29.21000,\"OCALA, FL\",1234 SE 17TH ST\n")
+    code, out, err = run_cli(["--csv", odd_csv, "--min-trust-rate", "0.5"])
+    check(code == 1, "a CSV with its own column names audits as unusable")
+    check("required columns not in the CSV: Addr_type, Score, X, Y" in err,
+          "the required columns that are absent are named, not just counted")
+    check("USER_address not in the CSV" in err
+          and "house-number check is skipped" in err,
+          "an absent optional column is a note naming the check it skips")
+    code, out, err = run_cli(["--csv", odd_csv, "--min-trust-rate", "0.5",
+                              "--score-field", "CONF",
+                              "--match-type-field", "KIND",
+                              "--x-field", "LON", "--y-field", "LAT",
+                              "--address-field", "IN_ADDR",
+                              "--matched-address-field", "OUT_ADDR"])
+    check(code == 0, "the six field overrides make the same CSV auditable")
+    check("TRUST rate: 50.0%" in out,
+          "the overridden columns produce the verdicts the data deserves")
+    check(err == "", "nothing is reported missing once the overrides name it")
+
+    # ---- the pile-up flags, over a batch that is mostly one point
+    stack_csv = tmpfile("stacked.csv", "Score,Addr_type,X,Y\n"
+                        + "98,PointAddress,-82.14000,29.18700\n" * 6)
+    code, out, err = run_cli(["--csv", stack_csv])
+    check(code == 1, "a batch stacked on one point fails the gate")
+    check("6 record(s) on -82.14, 29.187" in out,
+          "the CLI names the pile-up coordinate and its count")
+    check("coordinate pile-ups" not in run_cli(
+              ["--csv", stack_csv, "--pileup-threshold", "7"])[1],
+          "--pileup-threshold raises the count a pile-up needs")
+    check("6 record(s) on" in run_cli(
+              ["--csv", stack_csv, "--pileup-threshold", "2"])[1],
+          "--pileup-threshold 2 is accepted, it is the smallest pile-up there "
+          "is")
+    near_csv = tmpfile("near.csv", "Score,Addr_type,X,Y\n"
+                       + "98,PointAddress,-82.30000,29.20000\n" * 3
+                       + "98,PointAddress,-82.3000001,29.2000001\n" * 3)
+    check("coordinate pile-ups" in run_cli(["--csv", near_csv])[1],
+          "coordinates inside the rounding tolerance are one pile-up")
+    check("coordinate pile-ups" not in run_cli(
+              ["--csv", near_csv, "--pileup-precision", "7"])[1],
+          "--pileup-precision splits those coordinates back apart")
+
+    # ---- the score and house number flags, end to end
+    check("TRUST rate: 60.0%" in run_cli(
+              ["--csv", batch_csv, "--trust-score", "85"])[1],
+          "--trust-score lets the row at 88 through")
+    check(("  %-8s %6d" % (REJECT, 1)) in run_cli(
+              ["--csv", batch_csv, "--suspect-score", "60"])[1],
+          "--suspect-score keeps the row at 61 out of REJECT")
+    check("TRUST rate: 60.0%" in run_cli(
+              ["--csv", batch_csv, "--house-number-tolerance", "9000"])[1],
+          "--house-number-tolerance stops flagging a far house number")
+    check("house number 1234 was matched to 9100" in run_cli(
+              ["--csv", batch_csv])[1],
+          "the default tolerance reports that house number difference")
+
+    # ---- the other two profiles, through the CLI, on real batch output
+    census_csv = tmpfile(
+        "census.csv",
+        "input_address,matched_address,lon,lat,match_type\n"
+        "1234 SE 17TH ST OCALA FL,\"1234 SE 17TH ST, OCALA, FL, 34471\","
+        "-82.12650,29.17860,Exact\n"
+        "55 NW 10TH AVE OCALA FL,\"57 NW 10TH AVE, OCALA, FL, 34475\","
+        "-82.14010,29.18990,Non_Exact\n"
+        "PO BOX 1234 OCALA FL,,,,No_Match\n"
+        "100 MAIN ST OCALA FL,\"100 MAIN ST, OCALA, FL\","
+        "-82.13000,29.18700,Tie\n")
+    code, out, err = run_cli(["--csv", census_csv, "--profile", "census",
+                              "--min-trust-rate", "0.25"])
+    check(code == 0, "a real census batch audits through the CLI")
+    check("TRUST rate: 25.0%" in out, "the census batch scores 25% TRUST")
+    check(err == "", "the census profile asks for no score column")
+    check("not an address-level match" in out,
+          "the census refusal reads as a sentence with no score in it")
+    nomi_csv = tmpfile(
+        "nominatim.csv",
+        "query,display_name,lon,lat,addresstype,importance\n"
+        "1234 SE 17TH ST,\"1234, SE 17th Street, Ocala\","
+        "-82.12650,29.17860,house,0.45\n"
+        "OCALA FL,\"Ocala, Marion County, Florida\","
+        "-82.14010,29.18720,city,0.82\n"
+        "SE 17TH ST,\"Southeast 17th Street, Ocala\","
+        "-82.13000,29.17900,road,0.30\n"
+        "34471,\"34471, Ocala, Florida\",-82.12000,29.16000,postcode,0.20\n")
+    code, out, err = run_cli(["--csv", nomi_csv, "--profile", "nominatim",
+                              "--min-trust-rate", "0.25"])
+    check(code == 0, "a real nominatim batch audits through the CLI")
+    check("TRUST rate: 25.0%" in out, "the nominatim batch scores 25% TRUST")
+    check("The score 0.82 says how well that AREA matched" in out,
+          "importance is reported as what it measured, the city it matched")
+
+    # ---- the exits a scheduled job reads
+    check(run_cli([])[0] == 64, "a run with no CSV is a usage error")
+    check(run_cli(["--csv", batch_csv, "--apply"])[0] == 64,
+          "--apply without --out is a usage error")
+    code, out, err = run_cli(["--csv", batch_csv, "--pileup-threshold", "1"])
+    check(code == 64 and "--pileup-threshold must be at least 2" in err,
+          "a pile-up threshold of 1 is a usage error")
+    check(run_cli(["--csv", batch_csv, "--min-trust-rate", "2"])[0] == 64,
+          "a trust floor above 1 is a usage error")
+    check(run_cli(["--csv", batch_csv, "--min-trust-rate", "1"])[0] == 1,
+          "a floor of 1 is accepted and this batch does not clear it")
+    check(run_cli(["--csv", batch_csv, "--min-trust-rate", "0"])[0] == 0,
+          "a floor of 0 is accepted and nothing can fail it")
+    argv_before = sys.argv
+    try:
+        sys.argv = ["geocodesift.py", batch_csv, "--min-trust-rate", "0.5"]
+        check(run_cli(None)[0] == 0,
+              "main with no argv reads the arguments after the program name")
+    finally:
+        sys.argv = argv_before
+    check(run_cli(["--csv", batch_csv, "--trust-score", "50",
+                   "--suspect-score", "80"])[0] == 64,
+          "floors in the wrong order are a usage error, not a traceback")
+    check(run_cli(["--csv", os.path.join(tmp, "absent.csv")])[0] == 2,
+          "a CSV that is not there exits 2, not the gate's 1")
+    check(run_cli(["--csv", tmp])[0] == 2,
+          "a directory where a CSV should be exits 2")
+    huge_csv = tmpfile("huge.csv",
+                       "Score,Addr_type,X,Y,Match_addr\n"
+                       "98,PointAddress,-82.3,29.2,\"%s\"\n" % ("A" * 200000))
+    check(run_cli(["--csv", huge_csv])[0] == 2,
+          "a CSV field over the csv module's own limit exits 2, not 1"
+          "  <-- pinned defect")
+    empty_csv = tmpfile("empty.csv", "")
+    code, out, err = run_cli(["--csv", empty_csv])
+    check(code == 1 and "rows audited: 0" in out,
+          "an empty CSV fails the gate instead of scoring a perfect rate")
+
+    # ---- the environment default. The variable is removed afterwards rather
+    # than restored: the self-test owns the rest of this process, and putting
+    # an empty string back would itself be a usage error.
+    os.environ["GEOCODESIFT_MIN_TRUST_RATE"] = "0.10"
+    check(_parse(["--csv", "g.csv"]).min_trust_rate == 0.10,
+          "the environment sets the trust floor when no flag does")
+    check(_parse(["--csv", "g.csv", "--min-trust-rate", "0.5"]
+                 ).min_trust_rate == 0.5, "the flag wins over the environment")
+    check(run_cli(["--csv", batch_csv])[0] == 0,
+          "a batch that clears the environment's floor passes")
+    os.environ["GEOCODESIFT_MIN_TRUST_RATE"] = "ninety percent"
+    check(env_min_trust_rate() == DEFAULT_MIN_TRUST_RATE,
+          "an unreadable floor in the environment does not crash the parser"
+          "  <-- pinned defect")
+    check(run_cli(["--csv", batch_csv])[0] == 64,
+          "an unreadable floor in the environment is refused, not ignored"
+          "  <-- pinned defect")
+    os.environ.pop("GEOCODESIFT_MIN_TRUST_RATE", None)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
     print("-" * 68)
     total = passed[0] + len(failed)
     if failed:
@@ -1028,7 +1545,11 @@ def read_boundary(path):
 
 def write_audited(path, raw_rows, header, results):
     """Copy the input CSV with a verdict column and a reason column added."""
-    out_header = list(header) + ["gcs_verdict", "gcs_reasons"]
+    # Dropping them first, because auditing an audited CSV is how an operator
+    # re-checks a fixed batch. Appending blindly wrote gcs_verdict twice, and
+    # a duplicated column name is a file no reader can address by name.
+    out_header = [h for h in header if h not in ADDED_COLUMNS]
+    out_header += list(ADDED_COLUMNS)
     # extrasaction="ignore" because DictReader parks the surplus values of a
     # ragged row under the key None, and DictWriter treats that key as a fatal
     # unknown field. One stray comma inside an address would otherwise kill
@@ -1039,9 +1560,22 @@ def write_audited(path, raw_rows, header, results):
         writer.writeheader()
         for raw, result in zip(raw_rows, results):
             row = dict(raw)
-            row["gcs_verdict"] = result.verdict
-            row["gcs_reasons"] = "; ".join(result.reasons)
+            row[ADDED_COLUMNS[0]] = result.verdict
+            row[ADDED_COLUMNS[1]] = "; ".join(result.reasons)
             writer.writerow(row)
+
+
+def env_min_trust_rate():
+    """The --min-trust-rate default, read from the environment.
+
+    argparse evaluates this while it builds the parser, outside main()'s error
+    handling, so float() on a typo used to exit 1 with a traceback. 1 is the
+    code a scheduled job reads as "the batch failed the gate", which is a
+    different fact. The default comes back instead and main() refuses the run
+    with a usage error, so the typo is never silently ignored either.
+    """
+    value = to_number(os.environ.get("GEOCODESIFT_MIN_TRUST_RATE"))
+    return DEFAULT_MIN_TRUST_RATE if value is None else value
 
 
 def _parse(argv):
@@ -1064,8 +1598,7 @@ def _parse(argv):
                     help="GeoJSON file every geocode must fall inside. Off by "
                          "default because most batches have no boundary handy.")
     ap.add_argument("--min-trust-rate", dest="min_trust_rate", type=float,
-                    default=float(os.environ.get("GEOCODESIFT_MIN_TRUST_RATE",
-                                                 DEFAULT_MIN_TRUST_RATE)),
+                    default=env_min_trust_rate(),
                     help="TRUST fraction the batch must reach (default %.2f). "
                          "Env: GEOCODESIFT_MIN_TRUST_RATE"
                          % DEFAULT_MIN_TRUST_RATE)
@@ -1118,6 +1651,11 @@ def main(argv=None):
     if args.self_test:
         return self_test()
 
+    env_rate = os.environ.get("GEOCODESIFT_MIN_TRUST_RATE")
+    if env_rate is not None and to_number(env_rate) is None:
+        print("error: GEOCODESIFT_MIN_TRUST_RATE is %r, which is not a "
+              "number." % (env_rate,), file=sys.stderr)
+        return 64
     if not args.csv:
         print("error: --csv is required. Use --self-test to verify the tool "
               "without a batch.", file=sys.stderr)
@@ -1143,7 +1681,10 @@ def main(argv=None):
         })
         raw_rows, header = read_csv(args.csv)
         polygons = read_boundary(args.boundary) if args.boundary else None
-    except (IOError, OSError, ValueError) as exc:
+    except (IOError, OSError, ValueError, csv.Error) as exc:
+        # csv.Error too. A field over csv's 131072 character limit, or a NUL
+        # in the file, is an unreadable input, not a batch that failed the
+        # gate, and only the exit code tells those apart.
         print("error: %s" % exc, file=sys.stderr)
         return 2
 
@@ -1179,7 +1720,7 @@ def main(argv=None):
             # different fact and gets its own exit code.
             try:
                 write_audited(args.out, raw_rows, header, report.results)
-            except (IOError, OSError, ValueError) as exc:
+            except (IOError, OSError, ValueError, csv.Error) as exc:
                 print("error: could not write %s: %s" % (args.out, exc),
                       file=sys.stderr)
                 return 2
