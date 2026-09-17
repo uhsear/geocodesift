@@ -220,3 +220,4 @@ Other single-file tools in this portfolio that pair with this one:
 
 - [arcpy-nullscan](https://github.com/uhsear/arcpy-nullscan) - the NULLs a geocoded table also carries
 - [tzrot](https://github.com/uhsear/tzrot) - another way a valid-looking column is wrong
+- [ringwind](https://github.com/uhsear/ringwind) - a ring wound the wrong way makes every point-in-polygon test answer backwards
