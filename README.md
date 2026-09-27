@@ -51,10 +51,10 @@ PASS  the harness counts a false check, a missing error and a wrong error as thr
 ...
 PASS  and writes no bytecode cache beside the script
 --------------------------------------------------------------------
-552 assertions, 0 failed
+555 assertions, 0 failed
 ```
 
-The same 552 assertions pass on Windows with Python 3.13, on Python 3.9, and on Linux with Python
+The same 555 assertions pass on Windows with Python 3.13, on Python 3.9, and on Linux with Python
 3.12, and the runs print identical output. The self-test reaches every line and every branch of the script:
 `coverage run --branch geocodesift.py --self-test` reports 100 percent. The last checks feed the
 harness a false check, a call that raises nothing and a call that raises the wrong error, and
@@ -326,8 +326,8 @@ of its rules:
 | `po_box` | Starts `PO BOX`, `P O BOX` or `POST OFFICE BOX`. No other class applies. | `P.O. Box 12` |
 | `rural_route` | Starts `RR`, `HC`, `HCR`, `RURAL ROUTE` or `HIGHWAY CONTRACT`. No other class applies. | `RR 2 BOX 15` |
 | `no_number` | The first token has no leading house number. | `NE 31ST ST` |
-| `directional` | A directional before the street name, with a token after it. The exception is a suffix word straight after the directional that ends the street, with nothing after it but a directional or a unit word: that suffix word is the street's name. A directional straight after the last suffix or after a route number also counts. | `100 N MAIN ST`, `100 N COURT ST`, `100 MAIN ST NW` |
-| `route` | A route lead (`CR`, `SR`, `US`, `HWY`, `COUNTY` and others), any further route words such as `ROAD`, then a house number such as `900` or `25A`. `ROAD` and `RD` never start a route, so `100 ROAD 5` is plain. | `1200 COUNTY ROAD 900`, `100 CR 25A` |
+| `directional` | A directional before the street name, with a token after it. The exception is a suffix word straight after the directional that ends the street, with nothing after it but a directional or a unit word: the directional is then the street's name, and the suffix word stays the suffix. A directional straight after the last suffix or after a route number also counts. | `100 N MAIN ST`, `100 N COURT ST`, `100 MAIN ST NW` |
+| `route` | A route lead (`CR`, `SR`, `US`, `HWY`, `COUNTY` and others), any further route words such as `ROAD`, then a house number such as `900` or `900A`. `ROAD` and `RD` never start a route, so `100 ROAD 5` is plain. | `1200 COUNTY ROAD 900`, `100 CR 900A` |
 | `numbered_street` | The street name is an ordinal, or a bare number before a suffix. An ordinal is a number that ends `ST`, `ND`, `RD` or `TH`, or a spelled word from `FIRST` to `NINETEENTH`, a tens word (`TWENTIETH` to `NINETIETH`), `HUNDREDTH`, or a tens word and `FIRST` to `NINTH` (`TWENTY-FIRST` or `TWENTY FIRST`). | `55 NE 62ND AVE`, `100 SECOND AVE`, `100 TWENTY-FIRST ST` |
 | `unit` | A unit word (`APT`, `UNIT`, `STE`, `#`, `LOT` and others) after the first word of the street name, with a token after it. | `100 MAIN ST #4` |
 | `plain` | A house number and none of `directional`, `route`, `numbered_street` or `unit`. | `100 MAIN ST` |

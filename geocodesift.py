@@ -81,9 +81,10 @@ DEFAULT_HOUSE_TOLERANCE = 20
 # every address class must reach it too.
 DEFAULT_MIN_TRUST_RATE = 0.90
 
-# Rows an address class needs before its rate is judged. Under it the class is
-# refused a verdict: 3 of 5 is 60 percent with a 95 percent interval from 23 to
-# 88 percent, which says nothing about the geocoder.
+# Rows an address class needs before its rate alone is judged. Under it the
+# exact 95 percent interval decides: BELOW when it lies wholly under the floor
+# (2 of 20), ok when wholly over it, and a refusal when it holds the floor
+# (3 of 5 is 60 percent, but its interval runs from 15 to 95 percent).
 DEFAULT_MIN_CLASS_ROWS = 30
 
 # The z value of the class intervals: 1.96 is a two sided 95 percent interval.
@@ -500,8 +501,10 @@ def _polygon(rings):
     which exited 1, the code a scheduled job reads as "the batch failed".
     """
     if not isinstance(rings, (list, tuple)) or not rings:
-        raise ValueError("a GeoJSON Polygon needs a list of rings, got %r"
-                         % (rings,))
+        # Name the type, never the value: a wrong --boundary file can be a
+        # credentials JSON, and this message goes to stderr, the job's log.
+        raise ValueError("a GeoJSON Polygon needs a list of rings, got %s"
+                         % type(rings).__name__)
     for ring in rings:
         if (not isinstance(ring, (list, tuple)) or len(ring) < 3
                 or not all(_position(p) for p in ring)):
@@ -525,7 +528,8 @@ def polygons_from_geojson(obj):
     one is not the operator's job. Anything malformed raises ValueError.
     """
     if not isinstance(obj, dict):
-        raise ValueError("expected a GeoJSON object, got %r" % (obj,))
+        raise ValueError("expected a GeoJSON object, got %s"
+                         % type(obj).__name__)
     kind = obj.get("type")
     if kind == "FeatureCollection":
         out = []
@@ -555,7 +559,8 @@ def _members(obj, key):
     if value is None:
         return []
     if not isinstance(value, list):
-        raise ValueError("GeoJSON %r must be a list, got %r" % (key, value))
+        raise ValueError("GeoJSON %r must be a list, got %s"
+                         % (key, type(value).__name__))
     return value
 
 
@@ -885,9 +890,10 @@ def address_classes(address):
     - no_number: the first token has no leading house number. A fraction such
       as 1/2 after the house number is skipped.
     - directional: the next token is a directional, with a token after it.
-      One exception: when that token is a suffix word that ends the street,
-      with nothing after it but a directional or a unit word, it is the
-      street's name. "N MAIN ST" and "N COURT ST" are directional, "NORTH ST"
+      One exception: when the token after the directional is a suffix word
+      that ends the street, with nothing after it but a directional or a
+      unit word, the directional is the street's name and the suffix word
+      stays the suffix. "N MAIN ST" and "N COURT ST" are directional, "NORTH ST"
       is a street called North. "N HWY 999" is directional, because the
       route number follows HWY. A directional straight after the last suffix
       counts too.
@@ -931,8 +937,8 @@ def address_classes(address):
             i += 1
     if i + 1 < n and t[i] in DIRECTIONALS:
         # "100 NORTH ST" is a street called North, but "100 N COURT ST" is
-        # North Court Street: the suffix word is the name only when it ends
-        # the street. Reading every suffix word as the name moved directional
+        # North Court Street: the directional is the name only when the
+        # suffix word after it ends the street. Reading every suffix word as the name moved directional
         # rows into plain, where a failing geocoder hides.
         rest = t[i + 2:]
         named = (t[i + 1] in SUFFIXES
@@ -1517,6 +1523,19 @@ def _self_test(tmp):
         raises(lambda obj=obj: polygons_from_geojson(obj),
                "ValueError, not a crash, for %s  <-- pinned defect" % label)
 
+    for obj in (["svc_user", "not-a-real-secret"],
+                {"type": "FeatureCollection",
+                 "features": {"token": "not-a-real-secret"}},
+                {"type": "Polygon", "coordinates": "not-a-real-secret"}):
+        msg = ""
+        try:
+            polygons_from_geojson(obj)
+        except ValueError as exc:
+            msg = str(exc)
+        check(msg and "not-a-real-secret" not in msg,
+              "a wrong boundary file is named by type, its values never "
+              "echoed to stderr  <-- pinned defect")
+
     # ---- the pile-up detector over 30 synthetic rows
     stack = (-60.14000, 30.18700)      # the planted centroid stack
     complex4 = (-60.20000, 30.25000)   # a legitimate four unit complex
@@ -1980,10 +1999,10 @@ def _self_test(tmp):
           "is also a suffix")
     check(ac("100 CR 900 N") == ["directional", "route"],
           "a directional after the route number is directional")
-    check(ac("100 CR 25A") == ["route"],
-          "a route number is read as a house number, so 25A is a route"
+    check(ac("100 CR 900A") == ["route"],
+          "a route number is read as a house number, so 900A is a route"
           "  <-- pinned defect")
-    check(ac("100 SR 40A N") == ["directional", "route"],
+    check(ac("100 SR 123A N") == ["directional", "route"],
           "a directional after a lettered route number is directional"
           "  <-- pinned defect")
     check(ac("100 ROAD 5") == ["plain", "suffix:none"],
