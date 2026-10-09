@@ -46,15 +46,17 @@ PASS  a UTF-16 CSV exits 2, not 1  <-- pinned defect
 ...
 PASS  a bad integer exits 64, not argparse's 2  <-- pinned defect
 ...
+PASS  a unique prefix of --apply, --ap, is refused with exit 64  <-- pinned defect
+...
 PASS  an unexpected error exits 2 and says it is the tool's failure  <-- pinned defect
 PASS  the harness counts a false check, a missing error and a wrong error as three failures
 ...
 PASS  and writes no bytecode cache beside the script
 --------------------------------------------------------------------
-555 assertions, 0 failed
+556 assertions, 0 failed
 ```
 
-The same 555 assertions pass on Windows with Python 3.13, on Python 3.9, and on Linux with Python
+The same 556 assertions pass on Windows with Python 3.13, on Python 3.9, and on Linux with Python
 3.12, and the runs print identical output. The self-test reaches every line and every branch of the script:
 `coverage run --branch geocodesift.py --self-test` reports 100 percent. The last checks feed the
 harness a false check, a call that raises nothing and a call that raises the wrong error, and

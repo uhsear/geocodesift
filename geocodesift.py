@@ -2974,6 +2974,17 @@ def _self_test(tmp):
         check(got == 64 and "error:" in err.getvalue(),
               "%s exits 64, not argparse's 2  <-- pinned defect" % label)
 
+    # ---- a unique prefix of the write flag is refused, not read as --apply
+    err, got = io.StringIO(), None
+    try:
+        with contextlib.redirect_stderr(err):
+            main(["--csv", batch_csv, "--ap"])
+    except SystemExit as exc:
+        got = exc.code
+    check(got == 64 and "unrecognized arguments: --ap" in err.getvalue(),
+          "a unique prefix of --apply, --ap, is refused with exit 64"
+          "  <-- pinned defect")
+
     # ---- a crash inside the tool exits 2, never the gate's 1
     real_describe = describe
     def broken(*a, **k):
@@ -3151,6 +3162,7 @@ def _parse(argv):
         description="Audit a geocoded batch instead of believing its match rate.",
         epilog="Config precedence: flag > environment > the CONFIGURATION "
                "block. Nothing is written without --apply.",
+        allow_abbrev=False,
     )
     ap.add_argument("csv_positional", nargs="?", metavar="CSV",
                     help="CSV of geocoded results to audit, as a positional "
