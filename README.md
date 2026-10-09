@@ -4,7 +4,9 @@ Audit a geocoded batch instead of believing its match rate. Exits non-zero befor
 job publishes the wrong map. With `--by-class`, it also judges each kind of address on its own, so
 a healthy aggregate cannot hide a kind of address the geocoder fails. A class with fewer than 30
 rows is judged by its exact 95 percent interval, and is refused only when that interval is too
-wide to tell. A PASS names every class it refused.
+wide to tell. A PASS names every class it refused. `--profile tiers` reads the tier ladder of a
+locator that joins a key instead of parsing an address, and `--key-field` catches a join that
+put one record on several rows.
 
 Two thousand code-enforcement cases go through a geocoder for a commission heat map. The report
 says 96 percent matched. Three hundred and eighty records sit stacked on one downtown coordinate,
@@ -42,6 +44,18 @@ PASS  one blank address among good ones is a blank class, not a refused batch  <
 ...
 PASS  the self-test sets an exported floor aside, and removes its directory and restores the floor after a crash  <-- pinned defect
 ...
+PASS  a tier in none of the three lists raises rather than defaulting to SUSPECT  <-- pinned defect
+...
+PASS  an unlocated row that still carries a point is caught, and the one without a point is not  <-- pinned defect
+...
+PASS  a fanned-out batch has no pile-up, every row sits on its own point, and the key count still finds it  <-- pinned defect
+...
+PASS  a tiers batch at 95 percent fails on one unlocated row with an old point  <-- pinned defect
+...
+PASS  the same tier in two lists is refused before the CSV is read  <-- pinned defect
+...
+PASS  with --key-field the fan-out fails the batch, with no pile-up in sight  <-- pinned defect
+...
 PASS  a UTF-16 CSV exits 2, not 1  <-- pinned defect
 ...
 PASS  a bad integer exits 64, not argparse's 2  <-- pinned defect
@@ -53,10 +67,10 @@ PASS  the harness counts a false check, a missing error and a wrong error as thr
 ...
 PASS  and writes no bytecode cache beside the script
 --------------------------------------------------------------------
-556 assertions, 0 failed
+606 assertions, 0 failed
 ```
 
-The same 556 assertions pass on Windows with Python 3.13, on Python 3.9, and on Linux with Python
+The same 606 assertions pass on Windows with Python 3.13, on Python 3.9, and on Linux with Python
 3.12, and the runs print identical output. The self-test reaches every line and every branch of the script:
 `coverage run --branch geocodesift.py --self-test` reports 100 percent. The last checks feed the
 harness a false check, a call that raises nothing and a call that raises the wrong error, and
@@ -94,6 +108,7 @@ python geocodesift.py --csv geocoded.csv --boundary county.geojson --min-trust-r
 python geocodesift.py --csv geocoded.csv --out audited.csv --apply
 python geocodesift.py --csv geocoded.csv --by-class
 python geocodesift.py --csv vendor.csv --compare control.csv --compare-profile census
+python geocodesift.py --csv records.csv --profile tiers --key-field record_id
 ```
 
 A real run against 200 synthetic rows, 30 of them a planted ZIP centroid stack and 5 of them
@@ -128,7 +143,7 @@ down by one.
 | Flag | Default | What it does |
 |---|---|---|
 | `--csv` | none | Geocoded results to audit. Required. |
-| `--profile` | `esri` | Column names and match types to expect: `esri`, `census` or `nominatim`. |
+| `--profile` | `esri` | Column names and match types to expect: `esri`, `census`, `nominatim` or `tiers`. |
 | `--boundary` | off | GeoJSON file every geocode must fall inside. |
 | `--min-trust-rate` | `0.90` | TRUST fraction the batch must reach. Env: `GEOCODESIFT_MIN_TRUST_RATE` |
 | `--pileup-threshold` | `5` | Records on one coordinate before it counts as a pile-up. |
@@ -141,6 +156,10 @@ down by one.
 | `--compare` | none | A second result file for the same addresses, printed beside this one. Implies `--by-class`. |
 | `--compare-profile` | `--profile` | Profile of the `--compare` file. |
 | `--score-field` and six more | profile | Per-field column overrides, for a CSV that was renamed. |
+| `--key-field` | off | Column holding the record key. A key on more than one row fails the batch. |
+| `--trust-tiers` | `address_point,parcel_point` | Comma separated TRUST tiers. Needs `--profile tiers`. |
+| `--suspect-tiers` | `parcel_centroid` | Comma separated SUSPECT tiers. Needs `--profile tiers`. |
+| `--reject-tiers` | `parcel_not_found,no_key,unlocated` | Comma separated tiers that mean "no location". Needs `--profile tiers`. |
 | `--out` | none | Path for the audited copy of the CSV. |
 | `--apply` | off | Write `--out`. Without it nothing is written. |
 | `--self-test` | off | Run the offline assertions and exit. |
@@ -161,6 +180,7 @@ Each profile is a set of column names and a set of match types:
 | `esri` | `Score` | `Addr_type` | `X` | `Y` | `Match_addr` | `USER_address` | `Status` |
 | `census` | none | `match_type` | `lon` | `lat` | `matched_address` | `input_address` | none |
 | `nominatim` | `importance` | `addresstype` | `lon` | `lat` | `display_name` | `query` | none |
+| `tiers` | none | `tier` | `x` | `y` | none | `address` | none |
 
 The `census` profile reads no score column, because the Census batch geocoder returns none. The
 match type then carries the whole decision: `Exact` is TRUST, `Non_Exact` is SUSPECT, and `Tie` and
@@ -181,13 +201,16 @@ column a note says that a tied match cannot be caught.
 
 Exit codes: 0 the batch passed, 1 the batch failed the gate, 2 the input could not be read or
 the tool itself failed, 64 usage error. With `--by-class`, a class below the floor also exits 1.
+A row in a non-located tier that carries a point, and a record key on more than one row, exit 1
+at any TRUST rate. Under `--profile tiers`, a tier in no list and a tier in two lists exit 64.
 These exit 2:
 
 - a CSV without a required column (score, match type, x or y), because no row could be TRUST. A
   UTF-16 export, a binary file and a wrong `--profile` all land here. A `--compare` CSV without
   one exits 2 as well, rather than printing a control at 0 percent.
 - a CSV whose header names a column this reads more than once, because either one could be the
-  score.
+  score. The `--key-field` column counts as one this reads.
+- a `--key-field` that names no column of the CSV.
 - a boundary file that is not GeoJSON, holds a malformed polygon or no polygon at all, or nests
   too deeply to read. An empty FeatureCollection and one whose features have no geometry exit 2,
   as a boundary of type `Point` does.
@@ -343,6 +366,135 @@ it. `100 N HWY 999` is directional, because the route number follows `HWY`. `100
 an avenue and `100 COURT` has no suffix, because the first word of the name is never the suffix.
 The self-test holds a case for each rule and for each exception.
 
+## A tier ladder: the tiers profile
+
+Some records have no clean address, so their locator joins a key, such as a parcel number,
+instead of parsing an address. Each record gets a tier: it matched an address point, it matched a
+parcel point, it fell back to the parcel's centroid, the parcel was not found, or it had no key.
+The dashboard shows the top tiers only. Then a row labelled `unlocated` turns out to carry a
+point. The point is left over from an earlier run, because the rebuild wrote the new tier and
+kept the old geometry. That row is below every dashboard filter and on the map at the same time,
+and no count shows it.
+
+`--profile tiers` reads that ladder. It has no score column, as the `census` profile has none, so
+the tier carries the whole verdict. These are the default lists:
+
+| Verdict | Tiers |
+|---|---|
+| TRUST | `address_point`, `parcel_point` |
+| SUSPECT | `parcel_centroid` |
+| REJECT | `parcel_not_found`, `no_key`, `unlocated` |
+
+A reject tier means "this row has no location". A reject row with no coordinate is an ordinary
+REJECT. A reject row that carries a coordinate is REJECT with its own reason, and it fails the
+batch at any TRUST rate, a floor of 0 included. Put a tier that carries a point but must not be
+trusted, such as a centroid, in `--suspect-tiers`, not in `--reject-tiers`.
+
+The tier lists are closed. A tier in none of the three lists stops the run with exit 64 and
+names the tier. The other profiles read an unknown match type as SUSPECT. Here that hid a new
+fallback that the locator had started to write. A tier named in two lists exits 64 before the
+CSV is read, because one list would win in silence. Tier names are read stripped and in lower
+case. A blank tier is SUSPECT, as a blank match type is in the other profiles.
+
+A real run against 200 synthetic rows: 170 address points, 18 parcel points, 4 centroids,
+6 unlocated rows with no point, and 2 unlocated rows that kept an old point:
+
+```
+$ python geocodesift.py --csv records.csv --profile tiers
+rows audited: 200
+  TRUST       188
+  SUSPECT       4
+  REJECT        8
+TRUST rate: 94.0% (floor 90.0%)
+
+rows in a non-located tier that still carry a point: 2 (row 200, 201)
+
+first 5 row(s) that are not TRUST:
+  row 190 SUSPECT: match type 'parcel_centroid' is not a house-level match
+  ...
+
+FAIL: the batch clears the trust floor, but 2 row(s) in a non-located tier carry a point, so they sit below every filter and on the map at once. Do not publish it.
+```
+
+The same file with those two points blanked passes. With `--compare`, a control file whose
+profile is also `tiers` is read with the same tier lists.
+
+## One record, many rows: the fan-out
+
+A dashboard counts permits by area. To give each permit a location, a job joins the permits to
+address points on the parcel number. A parcel often holds several address points, so the join
+emits one row for each point, and every count on the dashboard is inflated. No row is wrong on
+its own line. Every row sits on a real address point, so the pile-up check sees nothing either.
+
+`--key-field` names the column that must be unique for each record. A key on more than one row
+fails the batch at any TRUST rate. Every row of that key drops to SUSPECT with the reason, and
+the report lists the repeated keys and counts the extra rows. A blank key names no record, so it
+is not counted. A real run against 40 synthetic records, 10 of which sit on parcels with three
+address points each:
+
+```
+$ python geocodesift.py --csv joined.csv --profile tiers
+rows audited: 60
+...
+PASS: the batch clears the trust floor.
+
+$ python geocodesift.py --csv joined.csv --profile tiers --key-field record_id --min-trust-rate 0
+rows audited: 60
+  TRUST        30
+  SUSPECT      30
+  REJECT        0
+TRUST rate: 50.0% (floor 0.0%)
+
+record keys on more than one row (20 extra row(s)):
+  key 'R031' on 3 rows
+  ...
+FAIL: the batch clears the trust floor, but 10 record key(s) are on more than one row, so a join fanned out and every count is inflated. Do not publish it.
+```
+
+geocodesift finds the fan-out. The fix belongs in the query that made it: give each record at
+most one location inside the join, rather than remove duplicates afterwards. A de-duplication
+step after the join must still choose a row, and it hides the fact that the join was wrong. In
+T-SQL, the usual form is `OUTER APPLY` with `TOP (1)`. The table and column names are synthetic:
+
+```sql
+SELECT r.record_id, pt.x, pt.y
+FROM records AS r
+OUTER APPLY (
+    SELECT TOP (1) a.x, a.y
+    FROM address_points AS a
+    WHERE a.parcel_key = r.parcel_key
+    ORDER BY a.is_primary DESC, a.point_id
+) AS pt;
+```
+
+This repository did not run that query against SQL Server. It relies on documented behaviour:
+
+- An `INNER` join returns all matching pairs of rows, so one record and three points give three
+  rows ([FROM clause, JOIN and APPLY](https://learn.microsoft.com/en-us/sql/t-sql/queries/from-transact-sql)).
+- `OUTER APPLY` produces one row for each row of the left table, even when the right side
+  returns nothing. A record with no point survives with NULLs, and can fall to a lower tier
+  (same page).
+- `ORDER BY` with `TOP` is the only way to say predictably which rows `TOP` returns
+  ([TOP](https://learn.microsoft.com/en-us/sql/t-sql/queries/top-transact-sql)). An `ORDER BY`
+  that can tie does not name one row, so end it with a unique column, as `a.point_id` above.
+
+**Materializing the locator.** SQL Server has no materialized view that can hold this lookup. Its
+stored form of a view is an indexed view, and the definition of an indexed view must not contain
+`SELECT TOP`, `OUTER APPLY`, `CROSS APPLY` or `LEFT OUTER JOIN`
+([Create indexed views](https://learn.microsoft.com/en-us/sql/relational-databases/views/create-indexed-views)).
+So the usual design is a plain table that a scheduled job rebuilds from the query. Run
+geocodesift on an export of that table before it is published, and publish only on exit 0. Two
+traps belong to the rebuild itself. A fan-out in the query multiplies the table, and
+`--key-field` catches it. A rebuild that pulls only part of its source still writes a table.
+geocodesift fails an empty table, but a short table of good rows passes, so guard the swap with
+a row-count check such as [safe-republish](https://github.com/uhsear/safe-republish).
+
+dbt does both checks well inside a dbt project. Its built-in `unique` test returns every key with
+more than one row, and its `accepted_values` test refuses a value outside a declared list
+([dbt data tests](https://docs.getdbt.com/docs/build/data-tests)). They need the table in a
+warehouse that dbt builds. geocodesift reads the exported CSV that a publish job already has, and
+puts the key count and the location checks behind one exit code.
+
 ## Why not the geocoder's own report
 
 Esri's Geocode Addresses already writes `Status`, `Score` and `Addr_type`, and the ArcGIS Pro
@@ -425,6 +577,14 @@ service, and it cannot audit a result file that is already on disk.
   0 of 1 the row prints a Wilson high of 79.3 percent beside `too few rows` at a 90 percent floor,
   because the exact high is 97.5 percent. The exact interval is conservative: it is often wider
   than a 95 percent interval needs to be, so a small class is refused a little more often.
+- Under `--profile tiers`, the records of one parcel can share its point. Five or more on one
+  point are a pile-up and drop to SUSPECT. Raise `--pileup-threshold` for a key-joined batch.
+- A reject tier is read as "no location". A tier that carries a point by design, such as a
+  centroid, belongs in `--suspect-tiers`, or every row in it fails the batch.
+- `--key-field` finds a repeated key. It cannot tell which row of that key is the right one, so
+  every row of the key drops to SUSPECT. It reads only the `--csv` file, not the `--compare` file.
+- A partial pull is not caught. An empty batch fails, but a batch of one good row passes. Check
+  the row count against the source before a rebuilt table replaces the old one.
 
 ## Contributing
 
@@ -445,3 +605,5 @@ Other single-file tools in this portfolio that pair with this one:
 - [arcpy-nullscan](https://github.com/uhsear/arcpy-nullscan) - the NULLs a geocoded table also carries
 - [tzrot](https://github.com/uhsear/tzrot) - another way a valid-looking column is wrong
 - [ringwind](https://github.com/uhsear/ringwind) - a ring wound the wrong way makes every point-in-polygon test answer backwards
+- [safe-republish](https://github.com/uhsear/safe-republish) - refuses to replace a table with a staged copy that came back short
+- [nalmatch](https://github.com/uhsear/nalmatch) - the parcel key a join matches on, checked against the roll before anything joins on it

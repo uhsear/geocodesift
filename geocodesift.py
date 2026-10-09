@@ -27,12 +27,19 @@ same floor, with a Wilson interval and a refusal when a class has too few rows
 to judge. --compare puts a second result file for the same addresses, such as
 a control geocoder, beside it class by class.
 
+A locator that joins a key instead of parsing an address writes a tier per
+row and no score. --profile tiers reads that ladder, and fails a batch where a
+row in a non-located tier still carries a point. --key-field fails a batch
+where one record key sits on several rows, which is what a one-to-many join
+leaves behind.
+
     python geocodesift.py --self-test
     python geocodesift.py --csv geocoded.csv --profile esri
     python geocodesift.py --csv geocoded.csv --boundary county.geojson --min-trust-rate 0.95
     python geocodesift.py --csv geocoded.csv --out audited.csv --apply
     python geocodesift.py --csv geocoded.csv --by-class
     python geocodesift.py --csv vendor.csv --compare control.csv
+    python geocodesift.py --csv records.csv --profile tiers --key-field record_id
 
 Exit codes: 0 the batch passed, 1 the batch failed the gate, 2 the input could
 not be read or the tool itself failed, 64 usage error.
@@ -186,7 +193,35 @@ PROFILES = {
         "trust_score": 20.0,
         "suspect_score": 10.0,
     },
+    # A locator that joins a key, such as a parcel number, instead of parsing
+    # an address writes a tier per row and no score. The tier list is closed:
+    # the operator declares it, so a tier in none of the three lists is a
+    # ladder nobody described, and it raises rather than reading SUSPECT. A
+    # reject tier means "no location", so a reject row that still carries a
+    # point is a contradiction: it sits below every dashboard filter and on
+    # the map at once, usually a point left over from an earlier run.
+    "tiers": {
+        "fields": {
+            "score": "",
+            "match_type": "tier",
+            "x": "x",
+            "y": "y",
+            "matched_addr": "",
+            "in_addr": "address",
+            "status": "",
+        },
+        "score_max": 100.0,
+        "score_optional": True,
+        "status_reject": {},
+        "closed_types": True,
+        "trust_types": ("address_point", "parcel_point"),
+        "suspect_types": ("parcel_centroid",),
+        "reject_types": ("parcel_not_found", "no_key", "unlocated"),
+    },
 }
+
+# The keys of a profile that the tier flags replace.
+TIER_LISTS = ("trust_types", "suspect_types", "reject_types")
 
 DEFAULT_PROFILE = "esri"
 
@@ -208,9 +243,14 @@ class RowResult(object):
 class Report(object):
     """The audited batch: counts, pile-ups and the TRUST rate."""
 
-    def __init__(self, results, pileups):
+    def __init__(self, results, pileups, stale=(), fanout=()):
         self.results = results
         self.pileups = pileups
+        # Indexes of rows in a reject tier that still carry a point, and the
+        # (key, rows) of every record key on more than one row. Either one
+        # fails the batch whatever the TRUST rate is.
+        self.stale = list(stale)
+        self.fanout = list(fanout)
         self.counts = {TRUST: 0, SUSPECT: 0, REJECT: 0}
         for r in results:
             self.counts[r.verdict] += 1
@@ -265,7 +305,7 @@ def score_percent(value, profile=DEFAULT_PROFILE):
 
 
 def classify(score, match_type, profile=DEFAULT_PROFILE, trust_score=None,
-             suspect_score=None, status=None):
+             suspect_score=None, status=None, tiers=None):
     """Classify one row from its score and its match type together.
 
     Score alone is the check everybody writes, and it is the one that publishes
@@ -279,12 +319,18 @@ def classify(score, match_type, profile=DEFAULT_PROFILE, trust_score=None,
 
     A bad floor raises, because it is the caller's mistake. A bad score is a
     cell in somebody's CSV, so it is a refusal of that row, never an error
-    that stops the batch.
+    that stops the batch. The one exception is a closed profile (tiers):
+    there a type in none of the lists means the declared ladder is
+    incomplete, which is the caller's mistake too.
+
+    tiers, from parse_tiers(), replaces the profile's three type lists.
     """
     if profile not in PROFILES:
         raise ValueError("unknown profile %r, expected one of %s"
                          % (profile, ", ".join(sorted(PROFILES))))
     prof = PROFILES[profile]
+    if tiers:
+        prof = dict(prof, **tiers)
     if trust_score is None:
         trust_score = prof.get("trust_score", DEFAULT_TRUST_SCORE)
     if suspect_score is None:
@@ -337,6 +383,12 @@ def classify(score, match_type, profile=DEFAULT_PROFILE, trust_score=None,
     known = (tuple(prof["trust_types"]) + tuple(prof["suspect_types"])
              + tuple(prof["reject_types"]))
     if mt not in known:
+        if prof.get("closed_types"):
+            # Defaulting to SUSPECT here hid a tier the ladder never named,
+            # such as a new fallback a locator started writing.
+            raise ValueError("tier %r is in none of the three tier lists. "
+                             "Add it to --trust-tiers, --suspect-tiers or "
+                             "--reject-tiers." % (match_type,))
         return SUSPECT, ("match type %r is not known to the %s profile"
                          % (match_type, profile))
 
@@ -425,6 +477,54 @@ def find_pileups(coords, threshold=DEFAULT_PILEUP_THRESHOLD,
     hits = [(k, n) for k, n in counts.items() if n >= threshold]
     hits.sort(key=lambda kn: (-kn[1], kn[0]))
     return hits
+
+
+def find_fanout(keys):
+    """Record keys on more than one row, as (key, rows), worst first.
+
+    A join on a key that is one-to-many on the other side, such as permits
+    joined to address points on a parcel number, emits one row per match. No
+    row is wrong on its own line and no coordinate repeats, so neither the
+    per-row checks nor the pile-up check can see it. Only the count of rows
+    per record key shows it. A blank key names no record and is not counted.
+    """
+    counts = {}
+    for key in keys:
+        key = (key or "").strip()
+        if key:
+            counts[key] = counts.get(key, 0) + 1
+    hits = [(k, n) for k, n in counts.items() if n > 1]
+    hits.sort(key=lambda kn: (-kn[1], kn[0]))
+    return hits
+
+
+def parse_tiers(trust=None, suspect=None, reject=None):
+    """The three tier lists of the tiers profile, from comma separated text.
+
+    A list left as None keeps the profile's default. Names are read stripped
+    and in lower case, as classify() reads the tier cell. A tier named in two
+    lists raises: the first list to be checked would win in silence, and the
+    operator would not know which verdict the tier got.
+    """
+    out = {}
+    for key, text in zip(TIER_LISTS, (trust, suspect, reject)):
+        if text is None:
+            out[key] = tuple(PROFILES["tiers"][key])
+            continue
+        names = tuple(n.strip().lower() for n in text.split(",") if n.strip())
+        if not names:
+            raise ValueError("a tier list needs at least one name, got %r"
+                             % (text,))
+        out[key] = names
+    seen = {}
+    for key in TIER_LISTS:
+        for name in out[key]:
+            if seen.get(name, key) != key:
+                raise ValueError("tier %r is in two tier lists, %s and %s. "
+                                 "Name it in one only."
+                                 % (name, seen[name], key))
+            seen[name] = key
+    return out
 
 
 def _on_segment(px, py, ax, ay, bx, by, eps=1e-12):
@@ -662,32 +762,49 @@ def extract_row(raw, fields):
 def audit(rows, profile=DEFAULT_PROFILE, trust_score=None, suspect_score=None,
           polygons=None, pileup_threshold=DEFAULT_PILEUP_THRESHOLD,
           pileup_precision=DEFAULT_PILEUP_PRECISION,
-          house_tolerance=DEFAULT_HOUSE_TOLERANCE):
+          house_tolerance=DEFAULT_HOUSE_TOLERANCE, keys=None, tiers=None):
     """Audit extracted rows and return a Report. No file, no network.
 
     An empty polygon list raises. An empty list is falsy, so a boundary file
     that parsed to no polygon at all would otherwise skip the containment
     check in silence: the check failing open on the one input that most needs
     an answer.
+
+    keys, when given, holds the record key of each row, for the fan-out
+    check. tiers replaces the type lists of a closed profile.
     """
     if polygons is not None and not polygons:
         raise ValueError("the boundary holds no polygon, so containment "
                          "cannot be checked. Refusing rather than skipping it.")
-    results = []
+    if keys is not None and len(keys) != len(rows):
+        raise ValueError("%d record keys for %d rows" % (len(keys), len(rows)))
+    # .get, because an unknown profile is classify()'s error to raise.
+    prof = dict(PROFILES.get(profile, {}), **(tiers or {}))
+    unlocated = prof["reject_types"] if prof.get("closed_types") else ()
+    results, stale = [], []
     for i, row in enumerate(rows):
         verdict, reason = classify(row.get("score"), row.get("match_type"),
                                    profile, trust_score, suspect_score,
-                                   row.get("status"))
+                                   row.get("status"), tiers)
         reasons = [reason]
 
         x, y = row.get("x"), row.get("y")
         if not _is_finite(x) or not _is_finite(y):
             verdict = worse(verdict, REJECT)
             reasons.append("no usable coordinate on the row")
-        elif polygons and not point_in_any(x, y, polygons):
-            verdict = worse(verdict, REJECT)
-            reasons.append("coordinate %r, %r falls outside the boundary"
-                           % (x, y))
+        else:
+            if polygons and not point_in_any(x, y, polygons):
+                verdict = worse(verdict, REJECT)
+                reasons.append("coordinate %r, %r falls outside the boundary"
+                               % (x, y))
+            if (row.get("match_type") or "").strip().lower() in unlocated:
+                # The forward case, no point, is REJECT above. This is the
+                # inverse: a tier that says "not located" over a real point,
+                # which the dashboard filters out and the map still draws.
+                stale.append(i)
+                reasons.append("tier %r says the row has no location, but it "
+                               "carries the point %r, %r"
+                               % (row.get("match_type"), x, y))
 
         problem = house_number_problem(row.get("in_addr"),
                                        row.get("matched_addr"),
@@ -713,7 +830,15 @@ def audit(rows, profile=DEFAULT_PROFILE, trust_score=None, suspect_score=None,
             r.verdict = worse(r.verdict, SUSPECT)
             r.reasons.append("shares coordinate %r with %d record(s)"
                              % (key, stacked[key]))
-    return Report(results, pileups)
+    fanout = find_fanout(keys) if keys is not None else []
+    repeated = dict(fanout)
+    for r, key in zip(results, keys or []):
+        key = (key or "").strip()
+        if key in repeated:
+            r.verdict = worse(r.verdict, SUSPECT)
+            r.reasons.append("record key %r is on %d rows, so a join fanned "
+                             "out" % (key, repeated[key]))
+    return Report(results, pileups, stale, fanout)
 
 
 def gate(report, min_trust_rate=DEFAULT_MIN_TRUST_RATE):
@@ -721,11 +846,13 @@ def gate(report, min_trust_rate=DEFAULT_MIN_TRUST_RATE):
 
     A batch with no rows fails whatever the floor is. At a floor of 0 the
     rate test alone passed it, as 0.0 >= 0.0, and an empty batch means the
-    upstream job broke.
+    upstream job broke. So does a batch with a non-located row that carries a
+    point, or a record key on more than one row: each publishes a wrong map
+    or a wrong count at any TRUST rate.
     """
     if not 0.0 <= min_trust_rate <= 1.0:
         raise ValueError("the trust rate floor must be between 0 and 1")
-    if not report.total:
+    if not report.total or report.stale or report.fanout:
         return 1
     return 0 if report.trust_rate >= min_trust_rate else 1
 
@@ -746,6 +873,24 @@ def describe(report, min_trust_rate=DEFAULT_MIN_TRUST_RATE, sample=5,
             out.append("  %d record(s) on %r, %r" % (n, x, y))
         if len(report.pileups) > sample:
             out.append("  ...and %d more" % (len(report.pileups) - sample))
+
+    if report.fanout:
+        out.append("")
+        out.append("record keys on more than one row (%d extra row(s)):"
+                   % sum(n - 1 for _, n in report.fanout))
+        for key, n in report.fanout[:sample]:
+            out.append("  key %r on %d rows" % (key, n))
+        if len(report.fanout) > sample:
+            out.append("  ...and %d more" % (len(report.fanout) - sample))
+
+    if report.stale:
+        out.append("")
+        more = len(report.stale) - sample
+        out.append("rows in a non-located tier that still carry a point: %d "
+                   "(row %s%s)" % (len(report.stale), ", ".join(
+                       str(numbers[i] if numbers else i + 2)
+                       for i in report.stale[:sample]),
+                       " and %d more" % more if more > 0 else ""))
 
     bad = [r for r in report.results if r.verdict != TRUST]
     if bad:
@@ -2870,6 +3015,221 @@ def _self_test(tmp):
           "an Esri tie fails the batch that it passed before  <-- pinned "
           "defect")
 
+    # ---- the tiers profile: a key-join locator's ladder, with no score
+    check(verdict(None, "address_point", "tiers") == TRUST
+          and verdict(None, "parcel_point", "tiers") == TRUST,
+          "the tiers profile trusts an address point and a parcel point")
+    check(verdict(None, "Parcel_Centroid", "tiers") == SUSPECT,
+          "a parcel centroid tier is SUSPECT, read in any case")
+    check(all(verdict(None, t, "tiers") == REJECT
+              for t in ("parcel_not_found", "no_key", "unlocated")),
+          "every non-located tier is REJECT")
+    check("score" not in classify(None, "unlocated", "tiers")[1],
+          "a tiers refusal does not describe a score it never had")
+    check(classify(None, "", "tiers")[0] == SUSPECT,
+          "a blank tier is SUSPECT, as a blank match type is")
+    raises(lambda: classify(None, "geocoded_by_hand", "tiers"),
+           "a tier in none of the three lists raises rather than defaulting "
+           "to SUSPECT  <-- pinned defect")
+    tl = parse_tiers("A, b", "c", "d,d")
+    check(tl == {"trust_types": ("a", "b"), "suspect_types": ("c",),
+                 "reject_types": ("d", "d")},
+          "tier lists are read stripped and in lower case, and a name twice "
+          "in one list is harmless")
+    check(parse_tiers() == dict((k, PROFILES["tiers"][k]) for k in TIER_LISTS),
+          "with no flags the tier lists are the profile's defaults")
+    check(classify(None, "a", "tiers", tiers=tl)[0] == TRUST
+          and classify(None, "d", "tiers", tiers=tl)[0] == REJECT,
+          "declared tier lists replace the profile's own")
+    raises(lambda: classify(None, "address_point", "tiers", tiers=tl),
+           "a default tier left out of the declared lists is unknown")
+    raises(lambda: parse_tiers("a", "a"),
+           "the same tier in two lists raises  <-- pinned defect")
+    raises(lambda: parse_tiers(trust="parcel_centroid"),
+           "a tier moved to one list but left in its default list raises")
+    raises(lambda: parse_tiers(" , "), "a tier list with no name raises")
+
+    def tier_row(i, tier, located=True):
+        return {"score": None, "match_type": tier,
+                "x": -60.3 - i * 0.01 if located else None,
+                "y": 30.3 + i * 0.01 if located else None,
+                "in_addr": "%d MAIN ST" % (100 + i), "matched_addr": None}
+
+    trep = audit([tier_row(0, "address_point"), tier_row(1, "unlocated"),
+                  tier_row(2, "unlocated", False),
+                  tier_row(3, "parcel_centroid")], "tiers")
+    check(trep.stale == [1],
+          "an unlocated row that still carries a point is caught, and the "
+          "one without a point is not  <-- pinned defect")
+    check(trep.results[1].verdict == REJECT
+          and "says the row has no location, but it carries the point"
+          in trep.results[1].reasons[-1],
+          "it is REJECT and carries its own reason, not only the tier's")
+    check(sum(trep.counts.values()) == trep.total == 4,
+          "the three verdict counts add up to the row count")
+    check(gate(trep, 0.0) == 1,
+          "a non-located row with a point fails the gate even at a floor of 0"
+          "  <-- pinned defect")
+    check(audit([tier_row(0, "Zip5")]).stale == [],
+          "only a closed profile reads a reject type as not located: an Esri "
+          "ZIP centroid has a point by design")
+    check(audit([tier_row(0, "a"), tier_row(1, "d")], "tiers",
+                tiers=tl).stale == [1],
+          "a declared reject tier is a non-located tier too")
+    check(any(l == "rows in a non-located tier that still carry a point: 1 "
+                   "(row 3)" for l in describe(trep)),
+          "the report counts the non-located rows that carry a point and "
+          "names them")
+    check("rows in a non-located tier that still carry a point: 6 (row 2, 3, "
+          "4, 5, 6 and 1 more)" in describe(audit(
+              [tier_row(i, "unlocated") for i in range(6)], "tiers")),
+          "past the sample size the rest are counted")
+
+    same_parcel = [dict(tier_row(0, "parcel_point"), match_type="parcel_point")
+                   for _ in range(5)]
+    check(len(audit(same_parcel, "tiers").pileups) == 1
+          and audit(same_parcel, "tiers", pileup_threshold=6).pileups == [],
+          "five records on one parcel point are a pile-up until the threshold "
+          "is raised, the limit the README names")
+
+    # ---- fan-out: one record on several rows, which no coordinate shows
+    check(find_fanout(["P1", "P2", " P1", "P1", "", None, "  ", "P2", "P3"])
+          == [("P1", 3), ("P2", 2)],
+          "keys on more than one row are found, worst first, blanks ignored")
+    check(find_fanout(["B", "A", "B", "A"]) == [("A", 2), ("B", 2)],
+          "fanned-out keys of one size are ordered by key")
+    check(find_fanout(["P1", "P2"]) == [], "unique keys are no fan-out")
+    fan = [dict(good, x=-60.3 - i * 0.01, y=30.3) for i in range(6)]
+    frep = audit(fan, keys=["P1", "P1", "P1", "P2", "P2", "P3"])
+    check(frep.pileups == [] and frep.fanout == [("P1", 3), ("P2", 2)],
+          "a fanned-out batch has no pile-up, every row sits on its own point,"
+          " and the key count still finds it  <-- pinned defect")
+    check([r.verdict for r in frep.results].count(SUSPECT) == 5
+          and "join fanned out" in frep.results[0].reasons[-1],
+          "every row of a repeated key drops to SUSPECT and says why")
+    check(gate(audit(fan, keys=["P%d" % i for i in range(6)]), 0.9) == 0
+          and gate(frep, 0.0) == 1,
+          "unique keys pass and a fan-out fails even a floor of 0")
+    raises(lambda: audit(fan, keys=["P1"]),
+           "fewer record keys than rows raises")
+    flines = describe(frep, sample=1)
+    check("record keys on more than one row (3 extra row(s)):" in flines
+          and "  key 'P1' on 3 rows" in flines
+          and "  ...and 1 more" in flines,
+          "the report counts the extra rows and lists each repeated key")
+    check(not any("...and" in l for l in describe(frep, sample=2)),
+          "exactly the sample size of keys prints no and-more line")
+    check(gate(audit([good]), 0.9) == 0,
+          "a one-row batch of a good row passes: a partial pull of one row "
+          "is not caught, the limit the README names")
+
+    # ---- the tiers profile and --key-field through the CLI
+    tier_head = "record_id,tier,x,y,address\n"
+
+    def tier_line(i, tier, located=True, key=None):
+        xy = ("%.5f,30.30000" % (-60.3 - i * 0.01)) if located else ","
+        return "%s,%s,%s,%d MAIN ST\n" % (key or "R%d" % i, tier, xy, 100 + i)
+
+    good_tiers = "".join(tier_line(i, ("address_point", "parcel_point")[i % 2])
+                         for i in range(19))
+    stale_csv = tmpfile("tiers-stale.csv", tier_head + good_tiers
+                        + tier_line(19, "unlocated"))
+    code, out, err = run_cli(["--csv", stale_csv, "--profile", "tiers"])
+    check(code == 1 and "TRUST rate: 95.0%" in out
+          and "FAIL: the batch clears the trust floor, but 1 row(s) in a "
+              "non-located tier carry a point" in out,
+          "a tiers batch at 95 percent fails on one unlocated row with an old "
+          "point  <-- pinned defect")
+    check("carry a point: 1 (row 21)" in out,
+          "the stale row is named by its line in the CSV")
+    check("row 21 REJECT: match type 'unlocated' is not an address-level "
+          "match; tier 'unlocated' says the row has no location, but it "
+          "carries the point -60.49, 30.3" in out,
+          "the row is named with both reasons")
+    clean_csv = tmpfile("tiers-clean.csv", tier_head + good_tiers
+                        + tier_line(19, "unlocated", False))
+    code, out, err = run_cli(["--csv", clean_csv, "--profile", "tiers"])
+    check(code == 0 and "PASS: the batch clears" in out
+          and "note: Match_addr" not in err,
+          "the same batch with no point on the unlocated row passes")
+    code, out, err = run_cli(["--csv", stale_csv, "--profile", "tiers",
+                              "--by-class"])
+    check(code == 1 and "address classes" in out,
+          "--by-class reads the tiers profile's address column")
+    code, out, err = run_cli(["--csv", stale_csv, "--profile", "tiers",
+                              "--min-trust-rate", "0.99"])
+    check(code == 1 and "below the trust floor" in out
+          and "Also, 1 row(s) in a non-located tier carry a point" in out,
+          "under the floor the stale row is still named")
+    code, out, err = run_cli(["--csv", stale_csv, "--profile", "tiers",
+                              "--reject-tiers", "no_location",
+                              "--suspect-tiers", "parcel_centroid,unlocated"])
+    check(code == 0 and ("  %-8s %6d" % (SUSPECT, 1)) in out
+          and ("  %-8s %6d" % (REJECT, 0)) in out,
+          "--reject-tiers and --suspect-tiers move a tier between lists")
+    code, out, err = run_cli(["--csv", stale_csv, "--profile", "tiers",
+                              "--trust-tiers", "address_point"])
+    check(code == 64 and "'parcel_point' is in none of the three tier lists"
+          in err,
+          "a tier in the CSV that no list names is a usage error naming it"
+          "  <-- pinned defect")
+    code, out, err = run_cli(["--csv", stale_csv, "--profile", "tiers",
+                              "--suspect-tiers", "unlocated"])
+    check(code == 64 and "is in two tier lists" in err and out == "",
+          "the same tier in two lists is refused before the CSV is read"
+          "  <-- pinned defect")
+    code, out, err = run_cli(["--csv", batch_csv, "--trust-tiers", "x"])
+    check(code == 64 and "need --profile tiers" in err,
+          "a tier flag without --profile tiers is a usage error")
+    gone_csv = tmpfile("tiers-gone.csv", tier_head + good_tiers
+                       + tier_line(19, "gone", False))
+    code, out, err = run_cli(["--csv", clean_csv, "--profile", "tiers",
+                              "--compare", gone_csv,
+                              "--compare-profile", "tiers",
+                              "--reject-tiers", "unlocated,no_key,"
+                                                "parcel_not_found,gone"])
+    check(code == 0 and "control file %s: 20 rows" % gone_csv in out,
+          "a tiers control is read with the declared tier lists")
+    dflt = _parse(["--csv", "g.csv"])
+    check(dflt.key_field is None and dflt.trust_tiers is None
+          and dflt.suspect_tiers is None and dflt.reject_tiers is None,
+          "--key-field and the tier lists default to off")
+
+    fan_csv = tmpfile("fanout.csv", tier_head + "".join(
+        tier_line(i, "parcel_point", key="P%d" % (i // 3)) for i in range(9))
+        + tier_line(9, "parcel_point", key="P9"))
+    code, out, err = run_cli(["--csv", fan_csv, "--profile", "tiers"])
+    check(code == 0 and "PASS" in out,
+          "without --key-field a fanned-out batch passes, every row is fine")
+    code, out, err = run_cli(["--csv", fan_csv, "--profile", "tiers",
+                              "--key-field", "record_id",
+                              "--min-trust-rate", "0"])
+    check(code == 1 and "3 record key(s) are on more than one row" in out
+          and "record keys on more than one row (6 extra row(s)):" in out
+          and "coordinate pile-ups" not in out,
+          "with --key-field the fan-out fails the batch, with no pile-up in "
+          "sight  <-- pinned defect")
+    code, out, err = run_cli(["--csv", fan_csv, "--profile", "tiers",
+                              "--key-field", "permit"])
+    check(code == 2 and "'permit', which is not a column" in err,
+          "a --key-field that is not a column exits 2")
+    two_keys = tmpfile("two-keys.csv", "record_id,tier,x,y,record_id\n"
+                       "R1,parcel_point,1,2,R2\n")
+    code, out, err = run_cli(["--csv", two_keys, "--profile", "tiers",
+                              "--key-field", "record_id"])
+    check(code == 2 and "names record_id more than once" in err,
+          "a key column named twice exits 2 rather than reading the last")
+    code, out, err = run_cli(["--csv", clean_csv, "--profile", "tiers",
+                              "--key-field", "record_id", "--compare", fan_csv,
+                              "--compare-profile", "tiers"])
+    check(code == 0 and "control file %s: 10 rows" % fan_csv in out,
+          "--key-field reads only the --csv file, not the --compare file")
+    fan_out = os.path.join(tmp, "fanout-audited.csv")
+    run_cli(["--csv", fan_csv, "--profile", "tiers", "--key-field",
+             "record_id", "--out", fan_out, "--apply"])
+    check([r["gcs_verdict"] for r in dicts(fan_out)[0]].count(SUSPECT) == 9,
+          "--apply writes each fanned-out row SUSPECT with its reason")
+
     # ---- bytes that are not UTF-8, and repeated header names, survive --apply
     cp_path = os.path.join(tmp, "cp1252.csv")
     cp_row = u"98,PointAddress,-60.3,30.2,100 CAF\u00c9 ST,100 CAF\u00c9 ST"
@@ -3232,6 +3592,15 @@ def _parse(argv):
                     help="column holding the address the geocoder returned")
     ap.add_argument("--status-field", dest="status_field",
                     help="column holding the match status (esri: M, T or U)")
+    ap.add_argument("--key-field", dest="key_field",
+                    help="column holding the record key. A key on more than "
+                         "one row means a join fanned out, and fails the batch")
+    for level in ("trust", "suspect", "reject"):
+        ap.add_argument("--%s-tiers" % level, dest="%s_tiers" % level,
+                        help="comma separated tiers that are %s, for --profile "
+                             "tiers (default %s)"
+                             % (level.upper(), ",".join(
+                                 PROFILES["tiers"][level + "_types"])))
     ap.add_argument("--out", help="path for the audited copy of the CSV")
     ap.add_argument("--apply", action="store_true",
                     help="write --out. Without this nothing is written.")
@@ -3298,6 +3667,16 @@ def _main(argv):
     if args.min_class_rows < 1:
         print("error: --min-class-rows must be at least 1.", file=sys.stderr)
         return 64
+    tier_text = (args.trust_tiers, args.suspect_tiers, args.reject_tiers)
+    if args.profile != "tiers" and tier_text != (None, None, None):
+        print("error: --trust-tiers, --suspect-tiers and --reject-tiers need "
+              "--profile tiers.", file=sys.stderr)
+        return 64
+    try:
+        tiers = parse_tiers(*tier_text) if args.profile == "tiers" else None
+    except ValueError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 64
     for flag, path in (("--csv", args.csv), ("--boundary", args.boundary),
                        ("--compare", args.compare)):
         if args.out and path and _same_file(args.out, path):
@@ -3345,6 +3724,10 @@ def _main(argv):
               "profile reads the submitted address from."
               % (control_fields["in_addr"], control_profile), file=sys.stderr)
         return 2
+    if args.key_field and args.key_field not in header:
+        print("error: --key-field names %r, which is not a column of the CSV."
+              % args.key_field, file=sys.stderr)
+        return 2
 
     missing = missing_columns(fields, header)
     if missing["required"]:
@@ -3362,7 +3745,8 @@ def _main(argv):
         # is skipped is useful; calling a valid export a warning is not.
         print("note: %s not in the CSV, so %s" % (name, check),
               file=sys.stderr)
-    for label, used, names in (("CSV", fields, header),
+    for label, used, names in (("CSV", dict(fields, key=args.key_field),
+                                header),
                                ("--compare CSV", control_fields,
                                 control_header)):
         repeated = ambiguous_columns(used, names)
@@ -3407,16 +3791,22 @@ def _main(argv):
     # --trust-score 0.5 was half a percent and passed rows at 0.01.
     floors = [None if v is None else score_percent(v, args.profile)
               for v in (args.trust_score, args.suspect_score)]
+    keys = ([row_dict(header, raw).get(args.key_field) for raw in raw_rows]
+            if args.key_field else None)
     try:
         report = audit(rows, args.profile, floors[0], floors[1],
                        polygons, args.pileup_threshold, args.pileup_precision,
-                       args.house_tolerance)
+                       args.house_tolerance, keys, tiers)
         # The control is judged by its own profile's score floors, because a
         # floor given for this file's score scale means nothing on another's.
         # The boundary, pile-up and house-number settings are shared.
+        # The tier lists name the vocabulary of the tiers profile, not this
+        # file's columns, so a tiers control is read with them too.
         control_report = audit(control_rows, control_profile, None, None,
                                polygons, args.pileup_threshold,
-                               args.pileup_precision, args.house_tolerance)
+                               args.pileup_precision, args.house_tolerance,
+                               None, tiers if control_profile == "tiers"
+                               else None)
     except ValueError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 64
@@ -3466,9 +3856,26 @@ def _main(argv):
 
     code = gate(report, args.min_trust_rate)
     below = ", ".join("%s %.1f%%" % (r.name, r.rate * 100.0) for r in failures)
+    # gate() fails these at any rate, so the rate alone decides which
+    # sentence opens the verdict.
+    rate_ok = report.total and report.trust_rate >= args.min_trust_rate
+    blockers = []
+    if report.stale:
+        blockers.append("%d row(s) in a non-located tier carry a point, so "
+                        "they sit below every filter and on the map at once"
+                        % len(report.stale))
+    if report.fanout:
+        blockers.append("%d record key(s) are on more than one row, so a join "
+                        "fanned out and every count is inflated"
+                        % len(report.fanout))
     if not report.total:
         print("\nFAIL: the batch holds no rows, which means the job that made "
               "it broke. Do not publish it.")
+    elif rate_ok and blockers:
+        print("\nFAIL: the batch clears the trust floor, but %s. Do not "
+              "publish it." % "; ".join(
+                  (["%d address class(es) do not: %s" % (len(failures), below)]
+                   if failures else []) + blockers))
     elif code == 0 and not failures:
         # A PASS that said nothing of a refused class read as a PASS for it.
         unsaid = ""
@@ -3486,6 +3893,8 @@ def _main(argv):
         if failures:
             print("%d address class(es) are below it as well: %s."
                   % (len(failures), below))
+        for line in blockers:
+            print("Also, %s." % line)
     return 1 if failures else code
 
 
