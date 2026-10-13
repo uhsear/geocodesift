@@ -3229,6 +3229,48 @@ def _self_test(tmp):
              "record_id", "--out", fan_out, "--apply"])
     check([r["gcs_verdict"] for r in dicts(fan_out)[0]].count(SUSPECT) == 9,
           "--apply writes each fanned-out row SUSPECT with its reason")
+    blank_key_rows = "".join(
+        "," + tier_line(i, "parcel_point").split(",", 1)[1] for i in range(10))
+    blank_keys = tmpfile("blank-keys.csv", tier_head + blank_key_rows)
+    code, out, err = run_cli(["--csv", blank_keys, "--profile", "tiers",
+                              "--key-field", "record_id"])
+    check(code == 2 and "blank on every row" in err and out == "",
+          "a --key-field column that is blank on every row exits 2, not PASS"
+          "  <-- pinned defect")
+    check(run_cli(["--csv", blank_keys, "--profile", "tiers"])[0] == 0,
+          "the same file without --key-field still passes")
+    some_keys = tmpfile("some-keys.csv", tier_head + blank_key_rows
+                        + tier_line(10, "parcel_point"))
+    code, out, err = run_cli(["--csv", some_keys, "--profile", "tiers",
+                              "--key-field", "record_id"])
+    check(code == 0 and "PASS" in out,
+          "one keyed row among blank ones is checked, not refused: blank keys "
+          "are skipped by design")
+
+    # ---- an empty value for a flag that switches a check on is refused
+    for flag in ("--boundary", "--compare", "--key-field", "--out"):
+        code, out, err = run_cli(["--csv", fan_csv, "--profile", "tiers",
+                                  flag, ""])
+        check(code == 64 and ("error: %s is empty" % flag) in err
+              and out == "",
+              "%s with an empty value exits 64, not a PASS with the check off"
+              "  <-- pinned defect" % flag)
+
+    # ---- padding and case on the tier and the key, and blank lines in the CSV
+    check(audit([tier_row(0, "  UnLocated ")], "tiers").stale == [0],
+          "a padded, mixed case non-located tier with a point is caught"
+          "  <-- pinned defect")
+    padded = audit(fan[:2], keys=["R001", " R001"])
+    check([r.verdict for r in padded.results] == [SUSPECT, SUSPECT],
+          "a padded copy of a repeated key is demoted with the first"
+          "  <-- pinned defect")
+    gappy = tmpfile("tiers-gappy.csv", tier_head + tier_line(0, "address_point")
+                    + "\n\n" + tier_line(1, "unlocated"))
+    code, out, err = run_cli(["--csv", gappy, "--profile", "tiers",
+                              "--min-trust-rate", "0"])
+    check("carry a point: 1 (row 5)" in out,
+          "the stale line names the row by its line in the file, blank lines"
+          " counted  <-- pinned defect")
 
     # ---- bytes that are not UTF-8, and repeated header names, survive --apply
     cp_path = os.path.join(tmp, "cp1252.csv")
@@ -3655,6 +3697,17 @@ def _main(argv):
         print("error: --csv is required. Use --self-test to verify the tool "
               "without a batch.", file=sys.stderr)
         return 64
+    for flag, value in (("--boundary", args.boundary),
+                        ("--compare", args.compare),
+                        ("--key-field", args.key_field), ("--out", args.out)):
+        if value == "":
+            # An empty string is falsy, so every check below that tests the
+            # flag would switch off in silence. A job that passes
+            # --boundary "$BOUNDARY" with the variable unset got a PASS and
+            # no containment check. Refused, as --csv "" is.
+            print("error: %s is empty. Name a value, or leave the flag out "
+                  "to skip it on purpose." % flag, file=sys.stderr)
+            return 64
     if args.pileup_threshold < 2:
         print("error: --pileup-threshold must be at least 2.", file=sys.stderr)
         return 64
@@ -3793,6 +3846,14 @@ def _main(argv):
               for v in (args.trust_score, args.suspect_score)]
     keys = ([row_dict(header, raw).get(args.key_field) for raw in raw_rows]
             if args.key_field else None)
+    if keys and not any((k or "").strip() for k in keys):
+        # find_fanout() skips a blank key by design, so a column that is
+        # blank on every row was a PASS for a check that never ran: a wrong
+        # column, an emptied one, or a join that NULLed the key.
+        print("error: the --key-field column %r is blank on every row, so "
+              "the fan-out check has nothing to count." % args.key_field,
+              file=sys.stderr)
+        return 2
     try:
         report = audit(rows, args.profile, floors[0], floors[1],
                        polygons, args.pileup_threshold, args.pileup_precision,

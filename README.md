@@ -8,8 +8,8 @@ wide to tell. A PASS names every class it refused. `--profile tiers` reads the t
 locator that joins a key instead of parsing an address, and `--key-field` catches a join that
 put one record on several rows.
 
-Two thousand code-enforcement cases go through a geocoder for a commission heat map. The report
-says 96 percent matched. Three hundred and eighty records sit stacked on one downtown coordinate,
+Two thousand code-enforcement cases go through a geocoder for a commission heat map. (The numbers
+in this story are illustrative.) The report says 96 percent matched. Three hundred and eighty records sit stacked on one downtown coordinate,
 because the geocoder fell back to the city centroid and scored that fallback 98.
 
 The heat map shows a violation hot spot in the historic district, where nothing happened. Nothing
@@ -56,6 +56,12 @@ PASS  the same tier in two lists is refused before the CSV is read  <-- pinned d
 ...
 PASS  with --key-field the fan-out fails the batch, with no pile-up in sight  <-- pinned defect
 ...
+PASS  a --key-field column that is blank on every row exits 2, not PASS  <-- pinned defect
+...
+PASS  --boundary with an empty value exits 64, not a PASS with the check off  <-- pinned defect
+...
+PASS  a padded, mixed case non-located tier with a point is caught  <-- pinned defect
+...
 PASS  a UTF-16 CSV exits 2, not 1  <-- pinned defect
 ...
 PASS  a bad integer exits 64, not argparse's 2  <-- pinned defect
@@ -67,22 +73,22 @@ PASS  the harness counts a false check, a missing error and a wrong error as thr
 ...
 PASS  and writes no bytecode cache beside the script
 --------------------------------------------------------------------
-606 assertions, 0 failed
+616 assertions, 0 failed
 ```
 
-The same 606 assertions pass on Windows with Python 3.13, on Python 3.9, and on Linux with Python
-3.12, and the runs print identical output. The self-test reaches every line and every branch of the script:
+The same 616 assertions pass on Windows with Python 3.13, 3.12 and 3.9, and on Linux with Python
+3.12. The runs print the same lines; Windows ends each line with CR LF where Linux ends it with LF. The self-test reaches every line and every branch of the script:
 `coverage run --branch geocodesift.py --self-test` reports 100 percent. The last checks feed the
 harness a false check, a call that raises nothing and a call that raises the wrong error, and
 confirm that it counts all three as failures.
 
 ## Requirements
 
-Python 3.9 or later. Standard library only: `csv`, `json`, `math`, `argparse`, and `tempfile`,
-`shutil`, `io`, `contextlib` and `importlib` for the self-test's own temporary files and its
-import check. No `arcpy`, no `shapely`,
-no `pandas`, no network and no credentials. It runs the same on ArcGIS Pro's Python and on a plain
-`python3`.
+Python 3.9 or later. Standard library only: `csv`, `json`, `math`, `argparse`, `os` and `sys`, and
+`tempfile`, `shutil`, `io`, `contextlib` and `importlib` for the self-test's own temporary files
+and its import check. No `arcpy`, no `shapely`, no `pandas`, no network and no credentials.
+Nothing in it needs `arcpy`, so it should run on the Python that ships with ArcGIS Pro. This
+repository did not run it there. The self-test ran on CPython 3.9, 3.12 and 3.13.
 
 ```
 git clone https://github.com/uhsear/geocodesift.git
@@ -187,14 +193,24 @@ match type then carries the whole decision: `Exact` is TRUST, `Non_Exact` is SUS
 `No_Match` are REJECT. A refusal under that profile names the match type and says nothing about a
 score, because there was never a score to report.
 
-The `census` profile does not read the Census batch geocoder's own file. That file has no header,
-puts the coordinate in one `lon,lat` cell, and splits `Match`, `Tie` and `No_Match` from `Exact`
-and `Non_Exact` across two columns. Reshape a Census result into the columns in the table first,
+The `census` profile does not read the Census batch geocoder's own file. For text and data files
+the Census returns CSV with no header. It puts the interpolated longitude and latitude in one
+column, and it splits the address range match indicator (`Match` or `No_Match` in the guide's
+example) from the match type (`Exact` or `Non_Exact`) across two columns
+([Census Geocoder User Guide, section 1.1.8](https://www2.census.gov/geo/pdfs/maps-data/data/Census_Geocoder_User_Guide.pdf),
+read 2026-10-13). The guide's example shows no `Tie`, so the `Tie` value of this profile is not
+checked against Census documentation. Reshape a Census result into the columns in the table first,
 with one `match_type` column that holds `Exact`, `Non_Exact`, `Tie` or `No_Match`. A Census file
 in its own layout, with a header added, exits 2 because `lon` and `lat` are missing. The
 `--*-field` overrides cannot fix it either, because no override splits one cell into two.
 
-The `esri` profile reads the `Status` column that Geocode Addresses writes. `T` is a tie: the
+The `esri` profile reads the `Status` column that Geocode Addresses writes. The tool page names
+`Status` and `Addr_type` as fields of its Minimal output
+([Geocode Addresses](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/geocoding/geocode-addresses.html),
+read 2026-10-13). That page does not list the codes or the `Addr_type` values, so the codes below
+(`M`, `T`, `U`) and the area types named in this README (`Zip5`, `PostalExt`, `Locality`) are
+the ones this tool's fixtures use. This repository did not check them against an Esri page.
+`T` is a tie: the
 geocoder chose one candidate from several with the same best score, so the point may be the wrong
 one. A tie is REJECT, as a census `Tie` is, and `U` (unmatched) is REJECT too. Without a `Status`
 column a note says that a tied match cannot be caught.
@@ -202,15 +218,17 @@ column a note says that a tied match cannot be caught.
 Exit codes: 0 the batch passed, 1 the batch failed the gate, 2 the input could not be read or
 the tool itself failed, 64 usage error. With `--by-class`, a class below the floor also exits 1.
 A row in a non-located tier that carries a point, and a record key on more than one row, exit 1
-at any TRUST rate. Under `--profile tiers`, a tier in no list and a tier in two lists exit 64.
-These exit 2:
+at any TRUST rate. Under `--profile tiers`, a tier in no list and a tier in two lists exit 64. An empty value for
+`--boundary`, `--compare`, `--key-field` or `--out` exits 64 as well, because an empty string
+would switch that check off in silence. These exit 2:
 
 - a CSV without a required column (score, match type, x or y), because no row could be TRUST. A
   UTF-16 export, a binary file and a wrong `--profile` all land here. A `--compare` CSV without
   one exits 2 as well, rather than printing a control at 0 percent.
 - a CSV whose header names a column this reads more than once, because either one could be the
   score. The `--key-field` column counts as one this reads.
-- a `--key-field` that names no column of the CSV.
+- a `--key-field` that names no column of the CSV, or a `--key-field` column that is blank on every
+  row, because the fan-out check would have nothing to count.
 - a boundary file that is not GeoJSON, holds a malformed polygon or no polygon at all, or nests
   too deeply to read. An empty FeatureCollection and one whose features have no geometry exit 2,
   as a boundary of type `Point` does.
@@ -252,8 +270,9 @@ as `\u03a9`.
 
 ## By address class
 
-A 911 center tested a vendor geocoder against a sample of live 911 traffic. The geocoder matched
-only 11 to 14 percent of the directional and numbered-street addresses, such as
+A 911 center tested a vendor geocoder against a sample of live 911 traffic. The figures in this
+paragraph are rounded and illustrative, not a measurement that anyone can check from this
+repository. The geocoder matched only 11 to 14 percent of the directional and numbered-street addresses, such as
 `1234 NE 31ST ST`. Those addresses were 75 percent of that sample. A control locator matched 99
 percent of the same addresses. On that sample the aggregate was low too. The danger is a batch
 where such addresses are a minority: a geocoder that fails them can still clear an aggregate
@@ -391,8 +410,8 @@ batch at any TRUST rate, a floor of 0 included. Put a tier that carries a point 
 trusted, such as a centroid, in `--suspect-tiers`, not in `--reject-tiers`.
 
 The tier lists are closed. A tier in none of the three lists stops the run with exit 64 and
-names the tier. The other profiles read an unknown match type as SUSPECT. Here that hid a new
-fallback that the locator had started to write. A tier named in two lists exits 64 before the
+names the tier. The other profiles read an unknown match type as SUSPECT. Here an unknown tier
+could hide a new fallback that the locator started to write. A tier named in two lists exits 64 before the
 CSV is read, because one list would win in silence. Tier names are read stripped and in lower
 case. A blank tier is SUSPECT, as a blank match type is in the other profiles.
 
@@ -478,11 +497,10 @@ This repository did not run that query against SQL Server. It relies on document
   ([TOP](https://learn.microsoft.com/en-us/sql/t-sql/queries/top-transact-sql)). An `ORDER BY`
   that can tie does not name one row, so end it with a unique column, as `a.point_id` above.
 
-**Materializing the locator.** SQL Server has no materialized view that can hold this lookup. Its
-stored form of a view is an indexed view, and the definition of an indexed view must not contain
-`SELECT TOP`, `OUTER APPLY`, `CROSS APPLY` or `LEFT OUTER JOIN`
-([Create indexed views](https://learn.microsoft.com/en-us/sql/relational-databases/views/create-indexed-views)).
-So the usual design is a plain table that a scheduled job rebuilds from the query. Run
+**Materializing the locator.** An indexed view cannot hold this lookup. Its definition must not
+contain `SELECT TOP`, `OUTER APPLY`, `CROSS APPLY` or `LEFT OUTER JOIN`
+([Create indexed views](https://learn.microsoft.com/en-us/sql/relational-databases/views/create-indexed-views),
+checked 2026-10-13). So a workable design is a plain table that a scheduled job rebuilds from the query. Run
 geocodesift on an export of that table before it is published, and publish only on exit 0. Two
 traps belong to the rebuild itself. A fan-out in the query multiplies the table, and
 `--key-field` catches it. A rebuild that pulls only part of its source still writes a table.
@@ -497,10 +515,10 @@ puts the key count and the location checks behind one exit code.
 
 ## Why not the geocoder's own report
 
-Esri's Geocode Addresses already writes `Status`, `Score` and `Addr_type`, and the ArcGIS Pro
-rematch pane shows all three per row. That is the right data, and the rematch pane is the right
-tool for fixing twenty addresses by hand. Nobody rematches two thousand rows by eye, and the pane
-has no exit code.
+Esri's Geocode Addresses already writes `Status`, `Score` and `Addr_type` in its Minimal output.
+That is the right data. ArcGIS Pro also has a rematch interface, which is the right tool for
+fixing twenty addresses by hand. Nobody rematches two thousand rows by eye, and the interface
+gives a scheduled job no exit code.
 
 The gap is the aggregate refusal. A scheduled job needs one number it can fail on, and it needs
 the pile-up count, which is a property of the batch rather than of any row. No per-row field can
@@ -530,8 +548,9 @@ service, and it cannot audit a result file that is already on disk.
   the classifier puts it in `no_number`.
 - Ray casting treats coordinates as plane geometry. A boundary in decimal degrees is tested as if
   it were flat, which is accurate at county scale and wrong for a continent.
-- Both the CSV and the boundary are read into memory. A few hundred thousand rows are fine; a
-  national file is not.
+- Both the CSV and the boundary are read into memory. This repository ran the audit on batches of
+  a few hundred rows only, not on a large file, so it states no row limit. A national file is
+  likely to be too large.
 - No projection handling. The coordinates in the CSV and the coordinates in the GeoJSON must
   already be in the same system, and nothing checks that they are.
 - The match type lists are per profile and are not exhaustive. An unknown type is SUSPECT, never
@@ -583,6 +602,33 @@ service, and it cannot audit a result file that is already on disk.
   centroid, belongs in `--suspect-tiers`, or every row in it fails the batch.
 - `--key-field` finds a repeated key. It cannot tell which row of that key is the right one, so
   every row of the key drops to SUSPECT. It reads only the `--csv` file, not the `--compare` file.
+- Keys are compared as text, case sensitive, with leading and trailing spaces trimmed. `R001` and
+  `r001` are two keys, and so are `0123` and `123`, so a fan-out that changes the case of a key or
+  drops its leading zeros is not found.
+- A stale point and a repeated key are checked in the `--csv` file only. A `--compare` control
+  file is audited for verdicts, and an old point or a repeated key in it does not fail the run.
+- A reject-tier row is caught as carrying an old point only when both X and Y hold a number. A
+  row with one of the two filled is REJECT as having no usable coordinate, and it is not counted
+  as a point, so the batch can pass.
+- A coordinate cell that is not a number counts as absent: `<Null>`, and a point written with a
+  comma for the decimal such as `-82,3001`. A reject-tier row holding one is not stale, and a
+  trust-tier row holding one is REJECT.
+- A coordinate of 0, 0 counts as a point. A reject-tier row at 0, 0 fails the batch, though 0, 0
+  is often a pipeline's stand-in for no location. Blank the columns of a row that has no
+  location.
+- Exit 64 also means an unlisted tier in the data, such as the text `NULL` or `None` that a SQL
+  export writes. The cause is the data, not the command line, and the message names the tier. A
+  scheduler that treats 64 as a bad command line will misread it.
+- A blank tier is SUSPECT even when the row carries no point.
+- A row number in a message counts CSV records, not physical lines, so a cell with a line break
+  inside quotes makes later numbers differ from an editor's line numbers. A line holding only
+  spaces is not blank to the reader: it becomes one REJECT row.
+- `--apply` does not copy the file byte for byte. It drops the UTF-8 byte order mark and the
+  blank lines of the input. It also writes straight to `--out`, so a write that dies midway leaves
+  a truncated file, and it writes on a failing batch too. Publish only on exit 0.
+- A boundary FeatureCollection that holds a `Point` feature beside its polygons exits 2.
+- The printed reasons and the `--out` reasons column echo tier text and coordinates from the
+  input, so a scheduled job's log holds row-level data.
 - A partial pull is not caught. An empty batch fails, but a batch of one good row passes. Check
   the row count against the source before a rebuilt table replaces the old one.
 
